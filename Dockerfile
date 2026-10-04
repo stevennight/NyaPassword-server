@@ -8,12 +8,25 @@
 # Rust is cross-compiled on the build machine with cargo-zigbuild (static musl
 # binaries for amd64 and arm64), so multi-arch images need no emulation.
 
+# The client core as WebAssembly (the web vault runs it in the browser).
+FROM --platform=$BUILDPLATFORM rust:1-bookworm AS wasm
+RUN rustup target add wasm32-unknown-unknown
+WORKDIR /src
+COPY common/Cargo.toml common/Cargo.lock common/
+RUN v=$(grep -A1 '^name = "wasm-bindgen"$' common/Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p') \
+    && cargo install wasm-bindgen-cli --version "$v" --locked
+COPY common/ common/
+WORKDIR /src/common
+RUN cargo build --locked --profile wasm-release --target wasm32-unknown-unknown -p npw-wasm \
+    && wasm-bindgen --target web --out-dir /pkg --out-name npw ../target/wasm32-unknown-unknown/wasm-release/npw_wasm.wasm
+
 FROM --platform=$BUILDPLATFORM node:24-alpine AS web
 WORKDIR /src/common/web
 COPY common/web/package.json common/web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY common/web/ ./
-RUN npm run build
+COPY --from=wasm /pkg/ src/wasm/pkg/
+RUN npx vite build
 
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS build
 ARG TARGETARCH
