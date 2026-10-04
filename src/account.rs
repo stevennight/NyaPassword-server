@@ -17,7 +17,13 @@ fn ok() -> Json<Value> {
 }
 
 pub fn is_member(c: &Connection, vault_id: &str, account_id: &str) -> rusqlite::Result<bool> {
-    Ok(c.query_row("SELECT 1 FROM vault_members WHERE vault_id = ?1 AND account_id = ?2", [vault_id, account_id], |_| Ok(())).optional()?.is_some())
+    Ok(c.query_row(
+        "SELECT 1 FROM vault_members WHERE vault_id = ?1 AND account_id = ?2",
+        [vault_id, account_id],
+        |_| Ok(()),
+    )
+    .optional()?
+    .is_some())
 }
 
 pub fn require_member(c: &Connection, vault_id: &str, account_id: &str) -> AppResult<()> {
@@ -35,7 +41,10 @@ pub fn vault_accounts(c: &Connection, vault_id: &str) -> rusqlite::Result<Vec<St
     rows.collect()
 }
 
-pub async fn get_account(State(st): State<Shared>, user: AuthUser) -> AppResult<Json<api::AccountResp>> {
+pub async fn get_account(
+    State(st): State<Shared>,
+    user: AuthUser,
+) -> AppResult<Json<api::AccountResp>> {
     let r = st
         .db
         .run(move |c| {
@@ -78,7 +87,11 @@ pub async fn get_account(State(st): State<Shared>, user: AuthUser) -> AppResult<
     Ok(Json(r))
 }
 
-pub async fn create_vault(State(st): State<Shared>, user: AuthUser, Json(req): Json<api::CreateVaultReq>) -> AppResult<Json<Value>> {
+pub async fn create_vault(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Json(req): Json<api::CreateVaultReq>,
+) -> AppResult<Json<Value>> {
     uuid::Uuid::parse_str(&req.id).map_err(|_| AppError::invalid("bad vault id"))?;
     for v in [&req.wrapped_key, &req.encrypted_meta] {
         unb64(v).ok_or_else(|| AppError::invalid("bad base64"))?;
@@ -104,7 +117,12 @@ pub async fn create_vault(State(st): State<Shared>, user: AuthUser, Json(req): J
     Ok(ok())
 }
 
-pub async fn update_vault_meta(State(st): State<Shared>, user: AuthUser, Path(vault_id): Path<String>, Json(req): Json<api::UpdateVaultMetaReq>) -> AppResult<Json<Value>> {
+pub async fn update_vault_meta(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path(vault_id): Path<String>,
+    Json(req): Json<api::UpdateVaultMetaReq>,
+) -> AppResult<Json<Value>> {
     unb64(&req.encrypted_meta).ok_or_else(|| AppError::invalid("bad base64"))?;
     let account = user.account_id.clone();
     st.db
@@ -125,17 +143,33 @@ pub async fn update_vault_meta(State(st): State<Shared>, user: AuthUser, Path(va
     Ok(ok())
 }
 
-pub async fn password_start(State(st): State<Shared>, user: AuthUser, Json(req): Json<api::ReRegisterStartReq>) -> AppResult<Json<api::OpaqueResp>> {
+pub async fn password_start(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Json(req): Json<api::ReRegisterStartReq>,
+) -> AppResult<Json<api::OpaqueResp>> {
     let id = uuid::Uuid::parse_str(&user.account_id).map_err(AppError::internal)?;
-    let resp = opaque::server_register_start(&st.opaque_setup, &unb64(&req.opaque_request).ok_or_else(|| AppError::invalid("bad base64"))?, id.as_bytes())?;
-    Ok(Json(api::OpaqueResp { opaque_response: b64(&resp) }))
+    let resp = opaque::server_register_start(
+        &st.opaque_setup,
+        &unb64(&req.opaque_request).ok_or_else(|| AppError::invalid("bad base64"))?,
+        id.as_bytes(),
+    )?;
+    Ok(Json(api::OpaqueResp {
+        opaque_response: b64(&resp),
+    }))
 }
 
-pub async fn password_finish(State(st): State<Shared>, user: AuthUser, Json(req): Json<api::ChangePasswordFinishReq>) -> AppResult<Json<Value>> {
+pub async fn password_finish(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Json(req): Json<api::ChangePasswordFinishReq>,
+) -> AppResult<Json<Value>> {
     if !st.cfg.allow_weak_kdf {
         req.kdf.validate()?;
     }
-    let record = opaque::server_register_finish(&unb64(&req.opaque_upload).ok_or_else(|| AppError::invalid("bad base64"))?)?;
+    let record = opaque::server_register_finish(
+        &unb64(&req.opaque_upload).ok_or_else(|| AppError::invalid("bad base64"))?,
+    )?;
     st.db
         .run(move |c| {
             let tx = c.transaction()?;
@@ -154,7 +188,10 @@ pub async fn password_finish(State(st): State<Shared>, user: AuthUser, Json(req)
     Ok(ok())
 }
 
-pub async fn devices(State(st): State<Shared>, user: AuthUser) -> AppResult<Json<Vec<api::DeviceRecord>>> {
+pub async fn devices(
+    State(st): State<Shared>,
+    user: AuthUser,
+) -> AppResult<Json<Vec<api::DeviceRecord>>> {
     let r = st
         .db
         .run(move |c| {
@@ -180,7 +217,11 @@ pub async fn devices(State(st): State<Shared>, user: AuthUser) -> AppResult<Json
     Ok(Json(r))
 }
 
-pub async fn revoke_device(State(st): State<Shared>, user: AuthUser, Path(device_id): Path<String>) -> AppResult<Json<Value>> {
+pub async fn revoke_device(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path(device_id): Path<String>,
+) -> AppResult<Json<Value>> {
     let account = user.account_id.clone();
     let dev = device_id.clone();
     st.db
@@ -196,11 +237,16 @@ pub async fn revoke_device(State(st): State<Shared>, user: AuthUser, Path(device
             Ok(())
         })
         .await?;
-    let _ = st.events.send((account, api::Event::DeviceRevoked { device_id: dev }));
+    let _ = st
+        .events
+        .send((account, api::Event::DeviceRevoked { device_id: dev }));
     Ok(ok())
 }
 
-pub async fn audit_log(State(st): State<Shared>, user: AuthUser) -> AppResult<Json<Vec<api::AuditEntry>>> {
+pub async fn audit_log(
+    State(st): State<Shared>,
+    user: AuthUser,
+) -> AppResult<Json<Vec<api::AuditEntry>>> {
     let r = st
         .db
         .run(move |c| {

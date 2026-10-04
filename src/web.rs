@@ -12,7 +12,11 @@ struct Assets;
 fn serve(path: &str) -> Option<Response> {
     let file = Assets::get(path)?;
     let mime = mime_guess::from_path(path).first_or_octet_stream();
-    let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+    let cache = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
     Some(
         (
             [
@@ -43,6 +47,10 @@ pub async fn static_handler(uri: Uri) -> Response {
             return r;
         }
     }
-    let fallback = if path == "admin" || path.starts_with("admin/") { "admin.html" } else { "index.html" };
+    let fallback = if path == "admin" || path.starts_with("admin/") {
+        "admin.html"
+    } else {
+        "index.html"
+    };
     serve(fallback).unwrap_or_else(|| (StatusCode::NOT_FOUND, "web UI not built").into_response())
 }

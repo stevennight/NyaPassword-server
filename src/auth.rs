@@ -26,7 +26,11 @@ pub fn new_token() -> String {
     b64(&npw_crypto::random_bytes::<32>())
 }
 
-pub fn client_ip(state: &Shared, headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
+pub fn client_ip(
+    state: &Shared,
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> String {
     if state.cfg.trust_proxy {
         if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(first) = v.split(',').next() {
@@ -42,15 +46,25 @@ fn d64(s: &str) -> AppResult<Vec<u8>> {
 }
 
 fn uuid_ok(s: &str) -> AppResult<[u8; 16]> {
-    uuid::Uuid::parse_str(s).map(|u| *u.as_bytes()).map_err(|_| AppError::invalid("bad id"))
+    uuid::Uuid::parse_str(s)
+        .map(|u| *u.as_bytes())
+        .map_err(|_| AppError::invalid("bad id"))
 }
 
 /// Creates a device (or reuses the caller's existing one) and a session.
-fn issue_session(c: &rusqlite::Connection, account_id: &str, device: &api::DeviceInfo) -> AppResult<api::Session> {
+fn issue_session(
+    c: &rusqlite::Connection,
+    account_id: &str,
+    device: &api::DeviceInfo,
+) -> AppResult<api::Session> {
     let now = now_ms();
     let reuse = match &device.id {
         Some(id) => c
-            .query_row("SELECT id FROM devices WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL", [id, account_id], |r| r.get::<_, String>(0))
+            .query_row(
+                "SELECT id FROM devices WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL",
+                [id, account_id],
+                |r| r.get::<_, String>(0),
+            )
             .optional()?,
         None => None,
     };
@@ -74,7 +88,11 @@ fn issue_session(c: &rusqlite::Connection, account_id: &str, device: &api::Devic
     new_session(c, account_id, &device_id)
 }
 
-fn new_session(c: &rusqlite::Connection, account_id: &str, device_id: &str) -> AppResult<api::Session> {
+fn new_session(
+    c: &rusqlite::Connection,
+    account_id: &str,
+    device_id: &str,
+) -> AppResult<api::Session> {
     let now = now_ms();
     let access = new_token();
     let refresh = new_token();
@@ -87,7 +105,13 @@ fn new_session(c: &rusqlite::Connection, account_id: &str, device_id: &str) -> A
         params![hash_token(&refresh), account_id, device_id, now + REFRESH_TTL, now],
     )?;
     c.execute("DELETE FROM sessions WHERE expires_at < ?1", [now])?;
-    Ok(api::Session { account_id: account_id.into(), device_id: device_id.into(), access_token: access, refresh_token: refresh, access_expires_at: now + ACCESS_TTL })
+    Ok(api::Session {
+        account_id: account_id.into(),
+        device_id: device_id.into(),
+        access_token: access,
+        refresh_token: refresh,
+        access_expires_at: now + ACCESS_TTL,
+    })
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -102,11 +126,19 @@ fn valid_login(login: &str) -> bool {
 // ------------------------------------------------------------------ server info
 
 pub async fn server_info(State(st): State<Shared>) -> AppResult<Json<api::ServerInfo>> {
-    let open = st.db.run(|c| Ok(c.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0))? == 0)).await?;
+    let open = st
+        .db
+        .run(|c| Ok(c.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get::<_, i64>(0))? == 0))
+        .await?;
     Ok(Json(api::ServerInfo {
         api: format!("{}.{}", api::API_MAJOR, api::API_MINOR),
         server_version: env!("CARGO_PKG_VERSION").into(),
-        features: vec![api::feature::EVENTS.into(), api::feature::ATTACHMENTS.into(), api::feature::REVISIONS.into(), api::feature::ATOMIC_BATCH.into()],
+        features: vec![
+            api::feature::EVENTS.into(),
+            api::feature::ATTACHMENTS.into(),
+            api::feature::REVISIONS.into(),
+            api::feature::ATOMIC_BATCH.into(),
+        ],
         registration_open: open && st.cfg.open_first_registration,
         time: now_ms(),
         epoch: st.epoch.clone(),
@@ -115,37 +147,66 @@ pub async fn server_info(State(st): State<Shared>) -> AppResult<Json<api::Server
 
 // ------------------------------------------------------------------ registration
 
-fn check_invite(c: &rusqlite::Connection, st: &Shared, invite: Option<&str>, consume: bool) -> AppResult<()> {
+fn check_invite(
+    c: &rusqlite::Connection,
+    st: &Shared,
+    invite: Option<&str>,
+    consume: bool,
+) -> AppResult<()> {
     let accounts: i64 = c.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
     if accounts == 0 && st.cfg.open_first_registration {
         return Ok(());
     }
     let Some(code) = invite.filter(|s| !s.is_empty()) else {
-        return Err(AppError::new(StatusCode::FORBIDDEN, code::REGISTRATION_CLOSED, "registration needs an invite"));
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            code::REGISTRATION_CLOSED,
+            "registration needs an invite",
+        ));
     };
     let h = hash_token(code.trim());
-    let ok: Option<i64> = c.query_row("SELECT expires_at FROM invites WHERE code_hash = ?1 AND used_at IS NULL", [&h], |r| r.get(0)).optional()?;
+    let ok: Option<i64> = c
+        .query_row(
+            "SELECT expires_at FROM invites WHERE code_hash = ?1 AND used_at IS NULL",
+            [&h],
+            |r| r.get(0),
+        )
+        .optional()?;
     match ok {
         Some(exp) if exp > now_ms() => {
             if consume {
-                c.execute("UPDATE invites SET used_at = ?2 WHERE code_hash = ?1", params![h, now_ms()])?;
+                c.execute(
+                    "UPDATE invites SET used_at = ?2 WHERE code_hash = ?1",
+                    params![h, now_ms()],
+                )?;
             }
             Ok(())
         }
-        _ => Err(AppError::new(StatusCode::FORBIDDEN, code::REGISTRATION_CLOSED, "invalid or expired invite")),
+        _ => Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            code::REGISTRATION_CLOSED,
+            "invalid or expired invite",
+        )),
     }
 }
 
-pub async fn register_start(State(st): State<Shared>, Json(req): Json<api::RegisterStartReq>) -> AppResult<Json<api::OpaqueResp>> {
+pub async fn register_start(
+    State(st): State<Shared>,
+    Json(req): Json<api::RegisterStartReq>,
+) -> AppResult<Json<api::OpaqueResp>> {
     if !valid_login(&req.login) {
         return Err(AppError::invalid("invalid login"));
     }
     let acct = uuid_ok(&req.account_id)?;
     let st2 = st.clone();
     let invite = req.invite.clone();
-    st.db.run(move |c| check_invite(c, &st2, invite.as_deref(), false)).await?;
+    st.db
+        .run(move |c| check_invite(c, &st2, invite.as_deref(), false))
+        .await?;
     let resp = opaque::server_register_start(&st.opaque_setup, &d64(&req.opaque_request)?, &acct)?;
-    Ok(Json(api::OpaqueResp { opaque_response: b64(&resp) }))
+    Ok(Json(api::OpaqueResp {
+        opaque_response: b64(&resp),
+    }))
 }
 
 pub async fn register_finish(
@@ -163,7 +224,14 @@ pub async fn register_finish(
         req.kdf.validate()?;
     }
     let record = opaque::server_register_finish(&d64(&req.opaque_upload)?)?;
-    for v in [&req.account_salt, &req.encrypted_account_key, &req.public_key, &req.encrypted_private_key, &req.vault.wrapped_key, &req.vault.encrypted_meta] {
+    for v in [
+        &req.account_salt,
+        &req.encrypted_account_key,
+        &req.public_key,
+        &req.encrypted_private_key,
+        &req.vault.wrapped_key,
+        &req.vault.encrypted_meta,
+    ] {
         d64(v)?;
     }
     let ip = client_ip(&st, &headers, Some(peer));
@@ -216,7 +284,8 @@ pub async fn register_finish(
 /// Answers for unknown logins are derived from a server secret, so they are
 /// stable and indistinguishable from real ones.
 fn fake_account(st: &Shared, login: &str) -> (String, String) {
-    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(st.keys.key().as_bytes()).expect("any key length");
+    let mut m =
+        <Hmac<Sha256> as Mac>::new_from_slice(st.keys.key().as_bytes()).expect("any key length");
     m.update(b"npw/fake-prelogin/v1");
     m.update(login.trim().to_lowercase().as_bytes());
     let out = m.finalize().into_bytes();
@@ -227,17 +296,41 @@ fn fake_account(st: &Shared, login: &str) -> (String, String) {
     (uuid::Uuid::from_bytes(id).to_string(), b64(&out[16..32]))
 }
 
-pub async fn prelogin(State(st): State<Shared>, Json(req): Json<api::PreloginReq>) -> AppResult<Json<api::PreloginResp>> {
+pub async fn prelogin(
+    State(st): State<Shared>,
+    Json(req): Json<api::PreloginReq>,
+) -> AppResult<Json<api::PreloginResp>> {
     let login = req.login.trim().to_string();
     let row = st
         .db
-        .run(move |c| Ok(c.query_row("SELECT id, kdf, account_salt FROM accounts WHERE login = ?1", [login], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))).optional()?))
+        .run(move |c| {
+            Ok(c.query_row(
+                "SELECT id, kdf, account_salt FROM accounts WHERE login = ?1",
+                [login],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?)
+        })
         .await?;
     Ok(Json(match row {
-        Some((id, kdf, salt)) => api::PreloginResp { account_id: id, kdf: serde_json::from_str(&kdf).map_err(AppError::internal)?, account_salt: salt },
+        Some((id, kdf, salt)) => api::PreloginResp {
+            account_id: id,
+            kdf: serde_json::from_str(&kdf).map_err(AppError::internal)?,
+            account_salt: salt,
+        },
         None => {
             let (id, salt) = fake_account(&st, &req.login);
-            api::PreloginResp { account_id: id, kdf: npw_api::KdfParams::default(), account_salt: salt }
+            api::PreloginResp {
+                account_id: id,
+                kdf: npw_api::KdfParams::default(),
+                account_salt: salt,
+            }
         }
     }))
 }
@@ -249,7 +342,13 @@ pub async fn login_start(
     Json(req): Json<api::LoginStartReq>,
 ) -> AppResult<Json<api::LoginStartResp>> {
     let ip = client_ip(&st, &headers, Some(peer));
-    if !st.limiter.hit(&format!("ip:{ip}"), 30, 60_000) || !st.limiter.hit(&format!("login:{}", req.login.trim().to_lowercase()), 20, 3_600_000) {
+    if !st.limiter.hit(&format!("ip:{ip}"), 30, 60_000)
+        || !st.limiter.hit(
+            &format!("login:{}", req.login.trim().to_lowercase()),
+            20,
+            3_600_000,
+        )
+    {
         return Err(AppError::rate_limited());
     }
     let login = req.login.trim().to_string();
@@ -257,9 +356,17 @@ pub async fn login_start(
     let row = st
         .db
         .run(move |c| {
-            Ok(c.query_row("SELECT id, opaque_record, opaque_recovery FROM accounts WHERE login = ?1", [login], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Option<Vec<u8>>>(2)?))
-            })
+            Ok(c.query_row(
+                "SELECT id, opaque_record, opaque_recovery FROM accounts WHERE login = ?1",
+                [login],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
             .optional()?)
         })
         .await?;
@@ -277,10 +384,19 @@ pub async fn login_start(
         Some(id) => uuid_ok(id)?,
         None => uuid_ok(&fake_account(&st, &req.login).0)?,
     };
-    let (state, resp) = opaque::server_login_start(&st.opaque_setup, record.as_deref(), &d64(&req.opaque_request)?, &cred_id)?;
+    let (state, resp) = opaque::server_login_start(
+        &st.opaque_setup,
+        record.as_deref(),
+        &d64(&req.opaque_request)?,
+        &cred_id,
+    )?;
     let login_id = uuid::Uuid::new_v4().to_string();
     let lid = login_id.clone();
-    let method_s = if method == LoginMethod::RecoveryCode { "recovery" } else { "password" };
+    let method_s = if method == LoginMethod::RecoveryCode {
+        "recovery"
+    } else {
+        "password"
+    };
     let real = record.is_some();
     st.db
         .run(move |c| {
@@ -292,7 +408,10 @@ pub async fn login_start(
             Ok(())
         })
         .await?;
-    Ok(Json(api::LoginStartResp { login_id, opaque_response: b64(&resp) }))
+    Ok(Json(api::LoginStartResp {
+        login_id,
+        opaque_response: b64(&resp),
+    }))
 }
 
 pub async fn login_finish(
@@ -307,15 +426,25 @@ pub async fn login_finish(
         .db
         .run(move |c| {
             let row = c
-                .query_row("SELECT account_id, state, expires_at FROM login_attempts WHERE id = ?1", [&lid], |r| {
-                    Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?))
-                })
+                .query_row(
+                    "SELECT account_id, state, expires_at FROM login_attempts WHERE id = ?1",
+                    [&lid],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
                 .optional()?;
             c.execute("DELETE FROM login_attempts WHERE id = ?1", [&lid])?;
             Ok(row)
         })
         .await?;
-    let Some((account_id, state, expires)) = attempt else { return Err(AppError::login_failed()) };
+    let Some((account_id, state, expires)) = attempt else {
+        return Err(AppError::login_failed());
+    };
     if expires < now_ms() {
         return Err(AppError::login_failed());
     }
@@ -329,7 +458,14 @@ pub async fn login_finish(
                 .run(move |c| {
                     let tx = c.transaction()?;
                     let s = issue_session(&tx, &account_id, &device)?;
-                    db::audit(&tx, Some(&account_id), "login", &s.device_id, &ip2, &device.name)?;
+                    db::audit(
+                        &tx,
+                        Some(&account_id),
+                        "login",
+                        &s.device_id,
+                        &ip2,
+                        &device.name,
+                    )?;
                     tx.commit()?;
                     Ok(s)
                 })
@@ -339,14 +475,20 @@ pub async fn login_finish(
         }
         (_, account_id) => {
             if let Some(a) = account_id {
-                let _ = st.db.run(move |c| Ok(db::audit(c, Some(&a), "login_failed", "", &ip2, "")?)).await;
+                let _ = st
+                    .db
+                    .run(move |c| Ok(db::audit(c, Some(&a), "login_failed", "", &ip2, "")?))
+                    .await;
             }
             Err(AppError::login_failed())
         }
     }
 }
 
-pub async fn refresh(State(st): State<Shared>, Json(req): Json<api::RefreshReq>) -> AppResult<Json<api::Session>> {
+pub async fn refresh(
+    State(st): State<Shared>,
+    Json(req): Json<api::RefreshReq>,
+) -> AppResult<Json<api::Session>> {
     let h = hash_token(&req.refresh_token);
     let s = st
         .db
@@ -374,10 +516,16 @@ pub async fn refresh(State(st): State<Shared>, Json(req): Json<api::RefreshReq>)
     Ok(Json(s))
 }
 
-pub async fn logout(State(st): State<Shared>, user: AuthUser) -> AppResult<Json<serde_json::Value>> {
+pub async fn logout(
+    State(st): State<Shared>,
+    user: AuthUser,
+) -> AppResult<Json<serde_json::Value>> {
     st.db
         .run(move |c| {
-            c.execute("DELETE FROM sessions WHERE device_id = ?1", [&user.device_id])?;
+            c.execute(
+                "DELETE FROM sessions WHERE device_id = ?1",
+                [&user.device_id],
+            )?;
             Ok(())
         })
         .await?;
@@ -417,8 +565,16 @@ pub async fn authenticate(st: &Shared, token: &str) -> AppResult<AuthUser> {
         })
         .await?;
     match row {
-        Some((_, _, _, Some(_), _)) => Err(AppError::new(StatusCode::UNAUTHORIZED, code::DEVICE_REVOKED, "device removed")),
-        Some((account_id, device_id, exp, None, _)) if exp > now_ms() => Ok(AuthUser { account_id, device_id, ip: String::new() }),
+        Some((_, _, _, Some(_), _)) => Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            code::DEVICE_REVOKED,
+            "device removed",
+        )),
+        Some((account_id, device_id, exp, None, _)) if exp > now_ms() => Ok(AuthUser {
+            account_id,
+            device_id,
+            ip: String::new(),
+        }),
         _ => Err(AppError::unauthorized()),
     }
 }
@@ -435,7 +591,10 @@ impl FromRequestParts<Shared> for AuthUser {
             .ok_or_else(AppError::unauthorized)?
             .to_string();
         let mut user = authenticate(st, &token).await?;
-        let peer = parts.extensions.get::<ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0);
         user.ip = client_ip(st, &parts.headers, peer);
         Ok(user)
     }

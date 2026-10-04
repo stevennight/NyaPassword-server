@@ -27,9 +27,16 @@ impl TestServer {
 
     /// Starts a server on `dir`, optionally on a fixed port (to "restart" the same server).
     pub async fn start_in(dir: PathBuf, port: Option<u16>) -> Self {
-        let cfg = Config { data_dir: dir.clone(), allow_weak_kdf: true, log: "warn".into(), ..Config::default() };
+        let cfg = Config {
+            data_dir: dir.clone(),
+            allow_weak_kdf: true,
+            log: "warn".into(),
+            ..Config::default()
+        };
         let state = nyapassword_server::open_state(cfg).unwrap();
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port.unwrap_or(0))).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port.unwrap_or(0)))
+            .await
+            .unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let st = state.clone();
@@ -40,7 +47,14 @@ impl TestServer {
             .await
             .unwrap();
         });
-        Self { url, state, dir, shutdown: Some(tx), task: Some(task), _tmp: None }
+        Self {
+            url,
+            state,
+            dir,
+            shutdown: Some(tx),
+            task: Some(task),
+            _tmp: None,
+        }
     }
 
     pub fn port(&self) -> u16 {
@@ -74,6 +88,9 @@ pub fn login_item(title: &str, user: &str, pw: &str) -> npw_model::ItemContent {
     it.title = title.into();
     it.field_mut("username").unwrap().value = user.into();
     it.field_mut("password").unwrap().value = pw.into();
-    it.urls.push(npw_model::UrlEntry::new(format!("https://{}.example.com/login", title.to_lowercase())));
+    it.urls.push(npw_model::UrlEntry::new(format!(
+        "https://{}.example.com/login",
+        title.to_lowercase()
+    )));
     it
 }

@@ -167,7 +167,10 @@ pub struct Db {
 }
 
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
@@ -192,14 +195,21 @@ pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
 
 impl Db {
     pub fn new(conn: Connection) -> Self {
-        Self { conn: Arc::new(Mutex::new(conn)) }
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+        }
     }
 
     /// Runs `f` on the connection in a blocking thread.
-    pub async fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut Connection) -> AppResult<T> + Send + 'static) -> AppResult<T> {
+    pub async fn run<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> AppResult<T> + Send + 'static,
+    ) -> AppResult<T> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let mut c = conn.lock().map_err(|_| AppError::internal("database lock poisoned"))?;
+            let mut c = conn
+                .lock()
+                .map_err(|_| AppError::internal("database lock poisoned"))?;
             f(&mut c)
         })
         .await
@@ -208,21 +218,35 @@ impl Db {
 
     /// Same, synchronously (startup, CLI).
     pub fn run_sync<T>(&self, f: impl FnOnce(&mut Connection) -> AppResult<T>) -> AppResult<T> {
-        let mut c = self.conn.lock().map_err(|_| AppError::internal("database lock poisoned"))?;
+        let mut c = self
+            .conn
+            .lock()
+            .map_err(|_| AppError::internal("database lock poisoned"))?;
         f(&mut c)
     }
 }
 
 pub fn get_setting(c: &Connection, k: &str) -> rusqlite::Result<Option<String>> {
-    c.query_row("SELECT v FROM settings WHERE k = ?1", [k], |r| r.get(0)).optional()
+    c.query_row("SELECT v FROM settings WHERE k = ?1", [k], |r| r.get(0))
+        .optional()
 }
 
 pub fn set_setting(c: &Connection, k: &str, v: &str) -> rusqlite::Result<()> {
-    c.execute("INSERT INTO settings (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", [k, v])?;
+    c.execute(
+        "INSERT INTO settings (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        [k, v],
+    )?;
     Ok(())
 }
 
-pub fn audit(c: &Connection, account_id: Option<&str>, action: &str, device_id: &str, ip: &str, detail: &str) -> rusqlite::Result<()> {
+pub fn audit(
+    c: &Connection,
+    account_id: Option<&str>,
+    action: &str,
+    device_id: &str,
+    ip: &str,
+    detail: &str,
+) -> rusqlite::Result<()> {
     c.execute(
         "INSERT INTO audit (account_id, at, action, device_id, ip, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![account_id, now_ms(), action, device_id, ip, detail],

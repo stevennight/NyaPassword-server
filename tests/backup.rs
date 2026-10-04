@@ -51,25 +51,45 @@ async fn backup_lose_everything_restore_and_continue() {
         .unwrap();
 
     let a = client("A");
-    let kit = a.register(&srv.url, "me@example.com", "pw", None).await.unwrap();
+    let kit = a
+        .register(&srv.url, "me@example.com", "pw", None)
+        .await
+        .unwrap();
     let vault = a.vaults().unwrap()[0].id.clone();
     let mut ids = vec![];
     for i in 0..20 {
-        ids.push(a.save_item(&vault, None, login_item(&format!("Before{i}"), "u", "p")).unwrap());
+        ids.push(
+            a.save_item(&vault, None, login_item(&format!("Before{i}"), "u", "p"))
+                .unwrap(),
+        );
     }
     a.sync().await.unwrap();
-    let att = a.add_attachment(&vault, &ids[0], "a.bin", "application/octet-stream", b"attachment bytes").await.unwrap();
+    let att = a
+        .add_attachment(
+            &vault,
+            &ids[0],
+            "a.bin",
+            "application/octet-stream",
+            b"attachment bytes",
+        )
+        .await
+        .unwrap();
     a.sync().await.unwrap();
 
     let run = backup::run_backup(&srv.state, "manual").await.unwrap();
-    assert!(run.results.iter().all(|r| r.ok && r.verified), "{:?}", run.results);
+    assert!(
+        run.results.iter().all(|r| r.ok && r.verified),
+        "{:?}",
+        run.results
+    );
     assert_eq!(run.items, 20);
     let drill = backup::run_drill(&srv.state, None).await.unwrap();
     assert!(drill.ok, "{}", drill.detail);
 
     // work continues after the backup
     for i in 0..5 {
-        a.save_item(&vault, None, login_item(&format!("After{i}"), "u", "p")).unwrap();
+        a.save_item(&vault, None, login_item(&format!("After{i}"), "u", "p"))
+            .unwrap();
     }
     let mut c0 = a.item(&vault, &ids[1]).unwrap().content.unwrap();
     c0.field_mut("password").unwrap().value = "changed after backup".into();
@@ -98,21 +118,39 @@ async fn backup_lose_everything_restore_and_continue() {
         username: String::new(),
         secret: String::new(),
     };
-    nyapassword_server::restore::run(args, data.clone()).await.unwrap();
+    nyapassword_server::restore::run(args, data.clone())
+        .await
+        .unwrap();
 
     let srv = TestServer::start_in(data.clone(), Some(port)).await;
     // the device carries on: it notices the restore and re-uploads what the backup lacked
     let r = a.sync().await.unwrap();
     assert!(r.full_resyncs >= 1);
-    assert_eq!(r.restored_to_server, 6, "5 new items and 1 edit were newer than the backup");
+    assert_eq!(
+        r.restored_to_server, 6,
+        "5 new items and 1 edit were newer than the backup"
+    );
 
     // a fresh device sees everything
     let b = client("B");
-    b.sign_in(&srv.url, "me@example.com", "pw", &kit.secret_key).await.unwrap();
+    b.sign_in(&srv.url, "me@example.com", "pw", &kit.secret_key)
+        .await
+        .unwrap();
     b.sync().await.unwrap();
     assert_eq!(b.list_items(&ItemFilter::default()).unwrap().len(), 25);
-    assert_eq!(b.item(&vault, &ids[1]).unwrap().content.unwrap().password().unwrap(), "changed after backup");
-    assert_eq!(b.attachment(&vault, &ids[0], &att).await.unwrap(), b"attachment bytes");
+    assert_eq!(
+        b.item(&vault, &ids[1])
+            .unwrap()
+            .content
+            .unwrap()
+            .password()
+            .unwrap(),
+        "changed after backup"
+    );
+    assert_eq!(
+        b.attachment(&vault, &ids[0], &att).await.unwrap(),
+        b"attachment bytes"
+    );
 
     // and the restored server backs up again
     let run = backup::run_backup(&srv.state, "manual").await.unwrap();
@@ -126,9 +164,14 @@ async fn retention_prunes_and_drill_detects_damage() {
     let tmp = tempfile::tempdir().unwrap();
     let target_dir = tmp.path().join("target");
     let srv = TestServer::start().await;
-    srv.state.db.run_sync(|c| backup::save_target(c, &fs_target(&target_dir))).unwrap();
+    srv.state
+        .db
+        .run_sync(|c| backup::save_target(c, &fs_target(&target_dir)))
+        .unwrap();
     let a = client("A");
-    a.register(&srv.url, "me@example.com", "pw", None).await.unwrap();
+    a.register(&srv.url, "me@example.com", "pw", None)
+        .await
+        .unwrap();
     let vault = a.vaults().unwrap()[0].id.clone();
 
     let st = srv.state.clone();
@@ -136,22 +179,34 @@ async fn retention_prunes_and_drill_detects_damage() {
         .db
         .run_sync(|c| {
             let mut s = backup::load_settings(c, &st)?;
-            s.retention = npw_api::admin::Retention { recent: 2, daily: 1, weekly: 1, monthly: 1 };
+            s.retention = npw_api::admin::Retention {
+                recent: 2,
+                daily: 1,
+                weekly: 1,
+                monthly: 1,
+            };
             backup::save_settings(c, &st, &s)
         })
         .unwrap();
     for i in 0..5 {
-        a.save_item(&vault, None, login_item(&format!("I{i}"), "u", "p")).unwrap();
+        a.save_item(&vault, None, login_item(&format!("I{i}"), "u", "p"))
+            .unwrap();
         a.sync().await.unwrap();
         backup::run_backup(&srv.state, "manual").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await; // object names have 1 s resolution
     }
     let dir = target_dir.join("npw").join("backups");
     let n = std::fs::read_dir(&dir).unwrap().count();
-    assert_eq!(n, 2, "recent=2 keeps two; the daily/weekly/monthly newest are among them");
+    assert_eq!(
+        n, 2,
+        "recent=2 keeps two; the daily/weekly/monthly newest are among them"
+    );
 
     // damage the newest archive: the drill must fail loudly
-    let mut newest: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    let mut newest: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
     newest.sort();
     let p = newest.last().unwrap();
     let mut bytes = std::fs::read(p).unwrap();

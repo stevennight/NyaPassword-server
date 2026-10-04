@@ -50,6 +50,7 @@ tempfile = "3"
 [dev-dependencies]
 npw-core = { path = "../common/crates/npw-core" }
 npw-model = { path = "../common/crates/npw-model" }
+npw-export = { path = "../common/crates/npw-export" }
 tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 tempfile = "3"

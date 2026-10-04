@@ -8,7 +8,11 @@ use nyapassword_server::config::Config;
 use nyapassword_server::{admin, backup, db, open_state, restore, serve};
 
 #[derive(Parser)]
-#[command(name = "nyapassword-server", version, about = "NyaPassword sync server")]
+#[command(
+    name = "nyapassword-server",
+    version,
+    about = "NyaPassword sync server"
+)]
 struct Cli {
     /// Data directory (default: $NYAPASSWORD_DATA or ./data).
     #[arg(long, global = true)]
@@ -21,6 +25,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once
 enum Cmd {
     /// Run the server (the default).
     Serve,
@@ -63,11 +68,25 @@ fn read_password(prompt: &str) -> anyhow::Result<String> {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(cli.data.clone())?;
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_new(&cfg.log).unwrap_or_else(|_| "info".into())).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_new(&cfg.log).unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     if cli.healthcheck {
-        let addr = if cfg.listen.ip().is_unspecified() { SocketAddr::from(([127, 0, 0, 1], cfg.listen.port())) } else { cfg.listen };
-        let ok = reqwest::Client::new().get(format!("http://{addr}/v1/health")).timeout(std::time::Duration::from_secs(5)).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+        let addr = if cfg.listen.ip().is_unspecified() {
+            SocketAddr::from(([127, 0, 0, 1], cfg.listen.port()))
+        } else {
+            cfg.listen
+        };
+        let ok = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/health"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
         std::process::exit(if ok { 0 } else { 1 });
     }
 
@@ -77,38 +96,56 @@ async fn main() -> anyhow::Result<()> {
             let st = open_state(cfg)?;
             let pw = read_password("new admin password: ")?;
             anyhow::ensure!(pw.chars().count() >= 12, "use at least 12 characters");
-            st.db.run_sync(|c| Ok(admin::set_password(c, &pw)?)).map_err(|e| anyhow::anyhow!(e.message))?;
+            st.db
+                .run_sync(|c| Ok(admin::set_password(c, &pw)?))
+                .map_err(|e| anyhow::anyhow!(e.message))?;
             println!("admin password set");
             Ok(())
         }
         Cmd::AdminTotp { off } => {
             let st = open_state(cfg)?;
             if off {
-                st.db.run_sync(|c| Ok(c.execute("DELETE FROM settings WHERE k = ?1", [admin::TOTP_KEY]).map(|_| ())?)).map_err(|e| anyhow::anyhow!(e.message))?;
+                st.db
+                    .run_sync(|c| {
+                        Ok(
+                            c.execute("DELETE FROM settings WHERE k = ?1", [admin::TOTP_KEY])
+                                .map(|_| ())?,
+                        )
+                    })
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
                 println!("admin TOTP off");
             } else {
                 let secret = npw_otp::base32_encode(&npw_crypto::random_bytes::<20>());
-                st.db.run_sync(|c| Ok(db::set_setting(c, admin::TOTP_KEY, &secret)?)).map_err(|e| anyhow::anyhow!(e.message))?;
+                st.db
+                    .run_sync(|c| Ok(db::set_setting(c, admin::TOTP_KEY, &secret)?))
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
                 println!("otpauth://totp/NyaPassword:admin?secret={secret}&issuer=NyaPassword");
             }
             Ok(())
         }
         Cmd::Invite { hours } => {
             let st = open_state(cfg)?;
-            let inv = st.db.run_sync(|c| Ok(admin::create_invite(c, hours)?)).map_err(|e| anyhow::anyhow!(e.message))?;
+            let inv = st
+                .db
+                .run_sync(|c| Ok(admin::create_invite(c, hours)?))
+                .map_err(|e| anyhow::anyhow!(e.message))?;
             println!("{} (valid for {hours} h)", inv.code);
             Ok(())
         }
         Cmd::BackupNow => {
             let st = open_state(cfg)?;
-            let run = backup::run_backup(&st, "manual").await.map_err(|e| anyhow::anyhow!(e.message))?;
+            let run = backup::run_backup(&st, "manual")
+                .await
+                .map_err(|e| anyhow::anyhow!(e.message))?;
             println!("{}", serde_json::to_string_pretty(&run)?);
             anyhow::ensure!(run.results.iter().all(|r| r.ok), "some targets failed");
             Ok(())
         }
         Cmd::Drill => {
             let st = open_state(cfg)?;
-            let run = backup::run_drill(&st, None).await.map_err(|e| anyhow::anyhow!(e.message))?;
+            let run = backup::run_drill(&st, None)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.message))?;
             println!("{}", serde_json::to_string_pretty(&run)?);
             anyhow::ensure!(run.ok, "drill failed");
             Ok(())

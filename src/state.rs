@@ -26,13 +26,18 @@ impl ServerKeys {
             return Ok(serde_json::from_slice(&std::fs::read(path)?)?);
         }
         let (age_identity, _) = npw_backup::generate_identity();
-        let k = Self { secret: b64(Key32::generate().as_bytes()), age_identity, created_at: db::now_ms() };
+        let k = Self {
+            secret: b64(Key32::generate().as_bytes()),
+            age_identity,
+            created_at: db::now_ms(),
+        };
         write_private(path, &serde_json::to_vec_pretty(&k)?)?;
         Ok(k)
     }
 
     pub fn key(&self) -> Key32 {
-        Key32::from_slice(&unb64(&self.secret).unwrap_or_default()).expect("server.key holds a 32-byte secret")
+        Key32::from_slice(&unb64(&self.secret).unwrap_or_default())
+            .expect("server.key holds a 32-byte secret")
     }
 
     pub fn age_recipient(&self) -> String {
@@ -41,12 +46,18 @@ impl ServerKeys {
 
     /// Seals a configuration secret (backup credentials) for the database.
     pub fn seal(&self, name: &str, value: &str) -> String {
-        b64(&envelope::seal(&self.key(), value.as_bytes(), &aad::device_secret(name)))
+        b64(&envelope::seal(
+            &self.key(),
+            value.as_bytes(),
+            &aad::device_secret(name),
+        ))
     }
 
     pub fn open(&self, name: &str, sealed: &str) -> Option<String> {
         let data = unb64(sealed)?;
-        envelope::open(&self.key(), &data, &aad::device_secret(name)).ok().and_then(|v| String::from_utf8(v).ok())
+        envelope::open(&self.key(), &data, &aad::device_secret(name))
+            .ok()
+            .and_then(|v| String::from_utf8(v).ok())
     }
 }
 

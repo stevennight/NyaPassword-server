@@ -24,7 +24,10 @@ pub const TOTP_KEY: &str = "admin_totp_secret";
 
 pub fn hash_password(pw: &str) -> String {
     let salt = SaltString::generate(&mut rand::rngs::OsRng);
-    Argon2::default().hash_password(pw.as_bytes(), &salt).expect("argon2 with default parameters").to_string()
+    Argon2::default()
+        .hash_password(pw.as_bytes(), &salt)
+        .expect("argon2 with default parameters")
+        .to_string()
 }
 
 pub fn set_password(c: &Connection, pw: &str) -> rusqlite::Result<()> {
@@ -64,30 +67,53 @@ pub async fn login(
     if !st.limiter.hit(&format!("admin:{ip}"), 10, 15 * 60_000) {
         return Err(AppError::rate_limited());
     }
-    let (hash, totp) = st.db.run(|c| Ok((db::get_setting(c, PASSWORD_KEY)?, db::get_setting(c, TOTP_KEY)?))).await?;
+    let (hash, totp) = st
+        .db
+        .run(|c| {
+            Ok((
+                db::get_setting(c, PASSWORD_KEY)?,
+                db::get_setting(c, TOTP_KEY)?,
+            ))
+        })
+        .await?;
     let Some(hash) = hash else {
-        return Err(AppError::new(axum::http::StatusCode::FORBIDDEN, api::code::FORBIDDEN, "admin password not set: run `nyapassword-server admin-password`"));
+        return Err(AppError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            api::code::FORBIDDEN,
+            "admin password not set: run `nyapassword-server admin-password`",
+        ));
     };
     let parsed = PasswordHash::new(&hash).map_err(AppError::internal)?;
-    let pw_ok = Argon2::default().verify_password(req.password.as_bytes(), &parsed).is_ok();
+    let pw_ok = Argon2::default()
+        .verify_password(req.password.as_bytes(), &parsed)
+        .is_ok();
     let totp_ok = match totp {
         None => true,
         Some(secret) => {
             let spec = npw_otp::OtpSpec::parse(&secret).map_err(AppError::internal)?;
             let now = (now_ms() / 1000) as u64;
             let code = req.totp.unwrap_or_default().replace(' ', "");
-            [now.saturating_sub(30), now, now + 30].iter().any(|t| spec.code(*t) == code)
+            [now.saturating_sub(30), now, now + 30]
+                .iter()
+                .any(|t| spec.code(*t) == code)
         }
     };
     let ip2 = ip.clone();
     if !(pw_ok && totp_ok) {
-        st.db.run(move |c| Ok(db::audit(c, None, "admin_login_failed", "", &ip2, "")?)).await?;
+        st.db
+            .run(move |c| Ok(db::audit(c, None, "admin_login_failed", "", &ip2, "")?))
+            .await?;
         return Err(AppError::login_failed());
     }
-    st.db.run(move |c| Ok(db::audit(c, None, "admin_login", "", &ip2, "")?)).await?;
+    st.db
+        .run(move |c| Ok(db::audit(c, None, "admin_login", "", &ip2, "")?))
+        .await?;
     let token = new_token();
     let expires_at = now_ms() + SESSION_TTL;
-    st.admin_sessions.lock().expect("lock").insert(hash_token(&token), expires_at);
+    st.admin_sessions
+        .lock()
+        .expect("lock")
+        .insert(hash_token(&token), expires_at);
     Ok(Json(adm::AdminSession { token, expires_at }))
 }
 
@@ -110,14 +136,19 @@ pub async fn health(State(st): State<Shared>, _a: Admin) -> AppResult<Json<adm::
                 revisions: n["revisions"],
                 attachments: n["attachments"],
                 attachment_bytes: n["attachment_bytes"],
-                db_bytes: std::fs::metadata(&db_path).map(|m| m.len() as i64).unwrap_or(0),
+                db_bytes: std::fs::metadata(&db_path)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0),
             })
         })
         .await?;
     Ok(Json(h))
 }
 
-pub async fn accounts(State(st): State<Shared>, _a: Admin) -> AppResult<Json<Vec<adm::AdminAccount>>> {
+pub async fn accounts(
+    State(st): State<Shared>,
+    _a: Admin,
+) -> AppResult<Json<Vec<adm::AdminAccount>>> {
     let r = st
         .db
         .run(|c| {
@@ -153,20 +184,35 @@ pub async fn accounts(State(st): State<Shared>, _a: Admin) -> AppResult<Json<Vec
     Ok(Json(r))
 }
 
-pub async fn revoke_device(State(st): State<Shared>, _a: Admin, Path(device_id): Path<String>) -> AppResult<Json<Value>> {
+pub async fn revoke_device(
+    State(st): State<Shared>,
+    _a: Admin,
+    Path(device_id): Path<String>,
+) -> AppResult<Json<Value>> {
     let dev = device_id.clone();
     let account = st
         .db
         .run(move |c| {
-            let acc: Option<String> = c.query_row("SELECT account_id FROM devices WHERE id = ?1", [&device_id], |r| r.get(0)).optional()?;
-            c.execute("UPDATE devices SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL", params![device_id, now_ms()])?;
+            let acc: Option<String> = c
+                .query_row(
+                    "SELECT account_id FROM devices WHERE id = ?1",
+                    [&device_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            c.execute(
+                "UPDATE devices SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+                params![device_id, now_ms()],
+            )?;
             c.execute("DELETE FROM sessions WHERE device_id = ?1", [&device_id])?;
             db::audit(c, acc.as_deref(), "device_revoke", "", "admin", &device_id)?;
             Ok(acc)
         })
         .await?;
     if let Some(a) = account {
-        let _ = st.events.send((a, api::Event::DeviceRevoked { device_id: dev }));
+        let _ = st
+            .events
+            .send((a, api::Event::DeviceRevoked { device_id: dev }));
     }
     Ok(Json(json!({})))
 }
@@ -175,9 +221,17 @@ pub async fn invites(State(st): State<Shared>, _a: Admin) -> AppResult<Json<Vec<
     let r = st
         .db
         .run(|c| {
-            let mut s = c.prepare("SELECT expires_at, used_at FROM invites ORDER BY created_at DESC LIMIT 50")?;
+            let mut s = c.prepare(
+                "SELECT expires_at, used_at FROM invites ORDER BY created_at DESC LIMIT 50",
+            )?;
             let rows = s
-                .query_map([], |r| Ok(adm::Invite { code: String::new(), expires_at: r.get(0)?, used_at: r.get(1)? }))?
+                .query_map([], |r| {
+                    Ok(adm::Invite {
+                        code: String::new(),
+                        expires_at: r.get(0)?,
+                        used_at: r.get(1)?,
+                    })
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -189,12 +243,25 @@ pub fn create_invite(c: &Connection, hours: u32) -> rusqlite::Result<adm::Invite
     let code = npw_otp::base32_encode(&npw_crypto::random_bytes::<10>());
     let code = format!("{}-{}", &code[..8], &code[8..16]);
     let expires_at = now_ms() + hours.clamp(1, 24 * 30) as i64 * 3_600_000;
-    c.execute("INSERT INTO invites (code_hash, expires_at, created_at) VALUES (?1, ?2, ?3)", params![hash_token(&code), expires_at, now_ms()])?;
-    Ok(adm::Invite { code, expires_at, used_at: None })
+    c.execute(
+        "INSERT INTO invites (code_hash, expires_at, created_at) VALUES (?1, ?2, ?3)",
+        params![hash_token(&code), expires_at, now_ms()],
+    )?;
+    Ok(adm::Invite {
+        code,
+        expires_at,
+        used_at: None,
+    })
 }
 
-pub async fn new_invite(State(st): State<Shared>, _a: Admin, Json(req): Json<adm::InviteReq>) -> AppResult<Json<adm::Invite>> {
-    Ok(Json(st.db.run(move |c| Ok(create_invite(c, req.hours)?)).await?))
+pub async fn new_invite(
+    State(st): State<Shared>,
+    _a: Admin,
+    Json(req): Json<adm::InviteReq>,
+) -> AppResult<Json<adm::Invite>> {
+    Ok(Json(
+        st.db.run(move |c| Ok(create_invite(c, req.hours)?)).await?,
+    ))
 }
 
 pub async fn audit(State(st): State<Shared>, _a: Admin) -> AppResult<Json<Vec<api::AuditEntry>>> {
@@ -256,7 +323,11 @@ pub async fn backup_status(State(st): State<Shared>, _a: Admin) -> AppResult<Jso
     Ok(Json(r))
 }
 
-pub async fn put_settings(State(st): State<Shared>, _a: Admin, Json(s): Json<adm::BackupSettings>) -> AppResult<Json<Value>> {
+pub async fn put_settings(
+    State(st): State<Shared>,
+    _a: Admin,
+    Json(s): Json<adm::BackupSettings>,
+) -> AppResult<Json<Value>> {
     for r in &s.recipients {
         if !npw_backup::valid_recipient(r) {
             return Err(AppError::invalid(format!("not an age recipient: {r}")));
@@ -266,11 +337,18 @@ pub async fn put_settings(State(st): State<Shared>, _a: Admin, Json(s): Json<adm
         return Err(AppError::invalid("bad schedule"));
     }
     let st2 = st.clone();
-    st.db.run(move |c| backup::save_settings(c, &st2, &s)).await?;
+    st.db
+        .run(move |c| backup::save_settings(c, &st2, &s))
+        .await?;
     Ok(Json(json!({})))
 }
 
-pub async fn put_target(State(st): State<Shared>, _a: Admin, Path(id): Path<String>, Json(mut t): Json<adm::BackupTarget>) -> AppResult<Json<adm::BackupTarget>> {
+pub async fn put_target(
+    State(st): State<Shared>,
+    _a: Admin,
+    Path(id): Path<String>,
+    Json(mut t): Json<adm::BackupTarget>,
+) -> AppResult<Json<adm::BackupTarget>> {
     t.id = id;
     if t.name.trim().is_empty() || t.endpoint.trim().is_empty() {
         return Err(AppError::invalid("name and endpoint are required"));
@@ -281,7 +359,9 @@ pub async fn put_target(State(st): State<Shared>, _a: Admin, Path(id): Path<Stri
     let is_url = t.endpoint.starts_with("https://") || t.endpoint.starts_with("http://");
     if t.kind == adm::TargetKind::Fs {
         if is_url || !std::path::Path::new(&t.endpoint).is_absolute() {
-            return Err(AppError::invalid("a directory target needs an absolute path"));
+            return Err(AppError::invalid(
+                "a directory target needs an absolute path",
+            ));
         }
     } else if !is_url {
         return Err(AppError::invalid("endpoint must be an http(s) URL"));
@@ -290,14 +370,19 @@ pub async fn put_target(State(st): State<Shared>, _a: Admin, Path(id): Path<Stri
     let r = st
         .db
         .run(move |c| {
-            let existing = backup::load_targets(c)?.into_iter().find(|x| x.target.id == t.id);
+            let existing = backup::load_targets(c)?
+                .into_iter()
+                .find(|x| x.target.id == t.id);
             let sealed = if !t.secret.is_empty() {
                 st2.keys.seal(&format!("target:{}", t.id), &t.secret)
             } else {
                 existing.map(|e| e.secret_sealed).unwrap_or_default()
             };
             t.secret.clear();
-            let stored = StoredTarget { target: t, secret_sealed: sealed };
+            let stored = StoredTarget {
+                target: t,
+                secret_sealed: sealed,
+            };
             backup::save_target(c, &stored)?;
             Ok(stored.public())
         })
@@ -305,12 +390,22 @@ pub async fn put_target(State(st): State<Shared>, _a: Admin, Path(id): Path<Stri
     Ok(Json(r))
 }
 
-pub async fn delete_target(State(st): State<Shared>, _a: Admin, Path(id): Path<String>) -> AppResult<Json<Value>> {
+pub async fn delete_target(
+    State(st): State<Shared>,
+    _a: Admin,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
     st.db
         .run(move |c| {
             c.execute("DELETE FROM backup_targets WHERE id = ?1", [&id])?;
-            c.execute("DELETE FROM backup_target_state WHERE target_id = ?1", [&id])?;
-            c.execute("DELETE FROM backup_target_blobs WHERE target_id = ?1", [&id])?;
+            c.execute(
+                "DELETE FROM backup_target_state WHERE target_id = ?1",
+                [&id],
+            )?;
+            c.execute(
+                "DELETE FROM backup_target_blobs WHERE target_id = ?1",
+                [&id],
+            )?;
             Ok(())
         })
         .await?;
@@ -318,9 +413,23 @@ pub async fn delete_target(State(st): State<Shared>, _a: Admin, Path(id): Path<S
 }
 
 /// Writes, reads and deletes a small probe object; in protect mode the delete is expected to fail.
-pub async fn test_target(State(st): State<Shared>, _a: Admin, Path(id): Path<String>) -> AppResult<Json<Value>> {
-    let t = st.db.run(move |c| backup::load_targets(c)?.into_iter().find(|t| t.target.id == id).ok_or_else(AppError::not_found)).await?;
-    let op = t.operator(&st.keys).map_err(|e| AppError::invalid(format!("{e:#}")))?;
+pub async fn test_target(
+    State(st): State<Shared>,
+    _a: Admin,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let t = st
+        .db
+        .run(move |c| {
+            backup::load_targets(c)?
+                .into_iter()
+                .find(|t| t.target.id == id)
+                .ok_or_else(AppError::not_found)
+        })
+        .await?;
+    let op = t
+        .operator(&st.keys)
+        .map_err(|e| AppError::invalid(format!("{e:#}")))?;
     let probe = format!("probe/nyapassword-probe-{}.txt", now_ms());
     let mut steps = vec![];
     let write = crate::backup::targets::write(&op, &probe, b"nyapassword probe".to_vec()).await;
@@ -334,10 +443,28 @@ pub async fn test_target(State(st): State<Shared>, _a: Admin, Path(id): Path<Str
     Ok(Json(json!({ "steps": steps })))
 }
 
-pub async fn target_objects(State(st): State<Shared>, _a: Admin, Path(id): Path<String>) -> AppResult<Json<Vec<adm::BackupObject>>> {
-    let t = st.db.run(move |c| backup::load_targets(c)?.into_iter().find(|t| t.target.id == id).ok_or_else(AppError::not_found)).await?;
-    let op = t.operator(&st.keys).map_err(|e| AppError::invalid(format!("{e:#}")))?;
-    Ok(Json(crate::backup::targets::list_backups(&op).await.map_err(|e| AppError::invalid(format!("{e:#}")))?))
+pub async fn target_objects(
+    State(st): State<Shared>,
+    _a: Admin,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<adm::BackupObject>>> {
+    let t = st
+        .db
+        .run(move |c| {
+            backup::load_targets(c)?
+                .into_iter()
+                .find(|t| t.target.id == id)
+                .ok_or_else(AppError::not_found)
+        })
+        .await?;
+    let op = t
+        .operator(&st.keys)
+        .map_err(|e| AppError::invalid(format!("{e:#}")))?;
+    Ok(Json(
+        crate::backup::targets::list_backups(&op)
+            .await
+            .map_err(|e| AppError::invalid(format!("{e:#}")))?,
+    ))
 }
 
 pub async fn run_now(State(st): State<Shared>, _a: Admin) -> AppResult<Json<adm::BackupRun>> {
@@ -350,7 +477,11 @@ pub struct DrillReq {
     target_id: Option<String>,
 }
 
-pub async fn drill(State(st): State<Shared>, _a: Admin, Json(req): Json<DrillReq>) -> AppResult<Json<adm::DrillRun>> {
+pub async fn drill(
+    State(st): State<Shared>,
+    _a: Admin,
+    Json(req): Json<DrillReq>,
+) -> AppResult<Json<adm::DrillRun>> {
     Ok(Json(backup::run_drill(&st, req.target_id).await?))
 }
 
@@ -362,6 +493,11 @@ pub async fn manual_drill_done(State(st): State<Shared>, _a: Admin) -> AppResult
 pub async fn test_notify(State(st): State<Shared>, _a: Admin) -> AppResult<Json<Value>> {
     let st2 = st.clone();
     let s = st.db.run(move |c| backup::load_settings(c, &st2)).await?;
-    let failed = backup::notify::send(&s.notify, "NyaPassword 测试通知", "如果你收到这条消息，告警通道工作正常。").await;
+    let failed = backup::notify::send(
+        &s.notify,
+        "NyaPassword 测试通知",
+        "如果你收到这条消息，告警通道工作正常。",
+    )
+    .await;
     Ok(Json(json!({ "failed": failed })))
 }

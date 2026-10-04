@@ -19,7 +19,8 @@ impl StoredTarget {
         if self.secret_sealed.is_empty() {
             return String::new();
         }
-        keys.open(&format!("target:{}", self.target.id), &self.secret_sealed).unwrap_or_default()
+        keys.open(&format!("target:{}", self.target.id), &self.secret_sealed)
+            .unwrap_or_default()
     }
 
     /// The target for API responses: no secret, `has_secret` set.
@@ -45,7 +46,11 @@ impl StoredTarget {
                 Operator::new(b)?.finish()
             }
             TargetKind::Webdav => {
-                let b = services::Webdav::default().endpoint(&t.endpoint).username(&t.username).password(&secret).root(&root);
+                let b = services::Webdav::default()
+                    .endpoint(&t.endpoint)
+                    .username(&t.username)
+                    .password(&secret)
+                    .root(&root);
                 Operator::new(b)?.finish()
             }
             TargetKind::Fs => {
@@ -78,10 +83,16 @@ pub async fn list_backups(op: &Operator) -> anyhow::Result<Vec<BackupObject>> {
     let mut out = vec![];
     for e in entries {
         let name = e.path().to_string();
-        let Some(t) = npw_backup::object_time(&name) else { continue };
-        out.push(BackupObject { size: e.metadata().content_length() as i64, modified_at: t, name });
+        let Some(t) = npw_backup::object_time(&name) else {
+            continue;
+        };
+        out.push(BackupObject {
+            size: e.metadata().content_length() as i64,
+            modified_at: t,
+            name,
+        });
     }
-    out.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    out.sort_by_key(|o| std::cmp::Reverse(o.modified_at));
     Ok(out)
 }
 
@@ -91,7 +102,11 @@ pub async fn list_attachments(op: &Operator) -> anyhow::Result<Vec<String>> {
         Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e.into()),
     };
-    Ok(entries.into_iter().filter_map(|e| e.path().rsplit('/').next().map(str::to_string)).filter(|n| !n.is_empty()).collect())
+    Ok(entries
+        .into_iter()
+        .filter_map(|e| e.path().rsplit('/').next().map(str::to_string))
+        .filter(|n| !n.is_empty())
+        .collect())
 }
 
 pub async fn delete(op: &Operator, path: &str) -> anyhow::Result<()> {

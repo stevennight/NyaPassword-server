@@ -21,13 +21,21 @@ const MANUAL_DRILL_KEY: &str = "manual_drill_at";
 const ALERTED_KEY: &str = "backup_alerted_at";
 
 pub fn default_settings() -> BackupSettings {
-    BackupSettings { retention: Retention::default(), recipients: vec![], debounce_minutes: 10, daily_hour_utc: 19, notify: Default::default() }
+    BackupSettings {
+        retention: Retention::default(),
+        recipients: vec![],
+        debounce_minutes: 10,
+        daily_hour_utc: 19,
+        notify: Default::default(),
+    }
 }
 
 pub fn load_settings(c: &Connection, st: &Shared) -> AppResult<BackupSettings> {
     match db::get_setting(c, SETTINGS_KEY)? {
         Some(sealed) => {
-            let json = st.keys.open(SETTINGS_KEY, &sealed).ok_or_else(|| AppError::internal("backup settings: cannot decrypt (wrong server.key?)"))?;
+            let json = st.keys.open(SETTINGS_KEY, &sealed).ok_or_else(|| {
+                AppError::internal("backup settings: cannot decrypt (wrong server.key?)")
+            })?;
             serde_json::from_str(&json).map_err(AppError::internal)
         }
         None => Ok(default_settings()),
@@ -42,8 +50,12 @@ pub fn save_settings(c: &Connection, st: &Shared, s: &BackupSettings) -> AppResu
 
 pub fn load_targets(c: &Connection) -> AppResult<Vec<StoredTarget>> {
     let mut s = c.prepare("SELECT data FROM backup_targets ORDER BY created_at")?;
-    let rows: Vec<String> = s.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    rows.iter().map(|d| serde_json::from_str(d).map_err(AppError::internal)).collect()
+    let rows: Vec<String> = s
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.iter()
+        .map(|d| serde_json::from_str(d).map_err(AppError::internal))
+        .collect()
 }
 
 pub fn save_target(c: &Connection, t: &StoredTarget) -> AppResult<()> {
@@ -56,9 +68,17 @@ pub fn save_target(c: &Connection, t: &StoredTarget) -> AppResult<()> {
 
 /// Changes since the last backup? (vault sequences, vault metadata, attachments, account rows)
 fn marker(c: &Connection) -> rusqlite::Result<String> {
-    let seqs: i64 = c.query_row("SELECT COALESCE(SUM(seq), 0) + COALESCE(SUM(meta_revision), 0) FROM vaults", [], |r| r.get(0))?;
+    let seqs: i64 = c.query_row(
+        "SELECT COALESCE(SUM(seq), 0) + COALESCE(SUM(meta_revision), 0) FROM vaults",
+        [],
+        |r| r.get(0),
+    )?;
     let atts: i64 = c.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0))?;
-    let acc: i64 = c.query_row("SELECT COALESCE(MAX(updated_at), 0) + COUNT(*) FROM accounts", [], |r| r.get(0))?;
+    let acc: i64 = c.query_row(
+        "SELECT COALESCE(MAX(updated_at), 0) + COUNT(*) FROM accounts",
+        [],
+        |r| r.get(0),
+    )?;
     Ok(format!("{seqs}:{atts}:{acc}"))
 }
 
@@ -68,14 +88,24 @@ pub fn pending_changes(c: &Connection) -> rusqlite::Result<bool> {
 
 pub fn runs(c: &Connection, limit: i64) -> AppResult<Vec<BackupRun>> {
     let mut s = c.prepare("SELECT data FROM backup_runs ORDER BY started_at DESC LIMIT ?1")?;
-    let rows: Vec<String> = s.query_map([limit], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    Ok(rows.iter().filter_map(|d| serde_json::from_str(d).ok()).collect())
+    let rows: Vec<String> = s
+        .query_map([limit], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows
+        .iter()
+        .filter_map(|d| serde_json::from_str(d).ok())
+        .collect())
 }
 
 pub fn drills(c: &Connection, limit: i64) -> AppResult<Vec<DrillRun>> {
     let mut s = c.prepare("SELECT data FROM drill_runs ORDER BY at DESC LIMIT ?1")?;
-    let rows: Vec<String> = s.query_map([limit], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    Ok(rows.iter().filter_map(|d| serde_json::from_str(d).ok()).collect())
+    let rows: Vec<String> = s
+        .query_map([limit], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows
+        .iter()
+        .filter_map(|d| serde_json::from_str(d).ok())
+        .collect())
 }
 
 pub fn manual_drill_at(c: &Connection) -> rusqlite::Result<Option<i64>> {
@@ -112,7 +142,9 @@ async fn snapshot(st: &Shared) -> AppResult<Snapshot> {
                 vaults.insert(id, seq);
             }
             let mut s = c.prepare("SELECT id FROM attachments")?;
-            let atts: Vec<String> = s.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let atts: Vec<String> = s
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
             let m = npw_backup::Manifest {
                 format: npw_backup::FORMAT,
                 created_at: now_ms(),
@@ -130,27 +162,58 @@ async fn snapshot(st: &Shared) -> AppResult<Snapshot> {
         .await?;
     let db = std::fs::read(&path).map_err(AppError::internal);
     let _ = std::fs::remove_file(&path);
-    Ok(Snapshot { db: db?, manifest, marker, attachments })
+    Ok(Snapshot {
+        db: db?,
+        manifest,
+        marker,
+        attachments,
+    })
 }
 
 /// Runs one backup to every enabled target. `trigger`: `change`, `daily`, `manual`.
 pub async fn run_backup(st: &Shared, trigger: &str) -> AppResult<BackupRun> {
     let _guard = st.backup_lock.lock().await;
     let st2 = st.clone();
-    let (settings, all_targets) = st.db.run(move |c| Ok((load_settings(c, &st2)?, load_targets(c)?))).await?;
-    let targets: Vec<StoredTarget> = all_targets.into_iter().filter(|t| t.target.enabled).collect();
+    let (settings, all_targets) = st
+        .db
+        .run(move |c| Ok((load_settings(c, &st2)?, load_targets(c)?)))
+        .await?;
+    let targets: Vec<StoredTarget> = all_targets
+        .into_iter()
+        .filter(|t| t.target.enabled)
+        .collect();
     let started_at = now_ms();
     let snap = snapshot(st).await?;
     let mut recipients = vec![st.keys.age_recipient()];
-    recipients.extend(settings.recipients.iter().filter(|r| npw_backup::valid_recipient(r)).cloned());
+    recipients.extend(
+        settings
+            .recipients
+            .iter()
+            .filter(|r| npw_backup::valid_recipient(r))
+            .cloned(),
+    );
     let key_file = std::fs::read(st.cfg.key_path()).map_err(AppError::internal)?;
-    let archive = npw_backup::seal(snap.manifest.clone(), &[("db.sqlite3", &snap.db), ("server.key", &key_file)], &recipients).map_err(AppError::internal)?;
+    let archive = npw_backup::seal(
+        snap.manifest.clone(),
+        &[("db.sqlite3", &snap.db), ("server.key", &key_file)],
+        &recipients,
+    )
+    .map_err(AppError::internal)?;
     let sha = npw_crypto::sha256_hex(&archive);
     let object = npw_backup::object_name(snap.manifest.created_at, snap.manifest.max_seq());
 
     let mut results = vec![];
     for t in &targets {
-        let res = backup_to(st, t, &object, &archive, &sha, &snap.attachments, &settings.retention).await;
+        let res = backup_to(
+            st,
+            t,
+            &object,
+            &archive,
+            &sha,
+            &snap.attachments,
+            &settings.retention,
+        )
+        .await;
         let (ok, verified, error) = match res {
             Ok(v) => (true, v, String::new()),
             Err(e) => (false, false, format!("{e:#}")),
@@ -168,7 +231,13 @@ pub async fn run_backup(st: &Shared, trigger: &str) -> AppResult<BackupRun> {
                 Ok(())
             })
             .await?;
-        results.push(TargetResult { target_id: t.target.id.clone(), ok, object: object.clone(), verified, error });
+        results.push(TargetResult {
+            target_id: t.target.id.clone(),
+            ok,
+            object: object.clone(),
+            verified,
+            error,
+        });
     }
 
     let run = BackupRun {
@@ -196,15 +265,34 @@ pub async fn run_backup(st: &Shared, trigger: &str) -> AppResult<BackupRun> {
         .await?;
     let failed: Vec<&TargetResult> = run.results.iter().filter(|r| !r.ok).collect();
     if !failed.is_empty() {
-        let body = failed.iter().map(|r| format!("{}: {}", r.target_id, r.error)).collect::<Vec<_>>().join("\n");
+        let body = failed
+            .iter()
+            .map(|r| format!("{}: {}", r.target_id, r.error))
+            .collect::<Vec<_>>()
+            .join("\n");
         notify::send(&settings.notify, "NyaPassword 备份失败", &body).await;
     }
-    tracing::info!("backup {} ({}): {} bytes, {} ok / {} targets", run.id, trigger, run.size, run.results.iter().filter(|r| r.ok).count(), run.results.len());
+    tracing::info!(
+        "backup {} ({}): {} bytes, {} ok / {} targets",
+        run.id,
+        trigger,
+        run.size,
+        run.results.iter().filter(|r| r.ok).count(),
+        run.results.len()
+    );
     Ok(run)
 }
 
 /// Uploads the archive and new attachments, reads the archive back, prunes. Returns "verified".
-async fn backup_to(st: &Shared, t: &StoredTarget, object: &str, archive: &[u8], sha: &str, attachments: &[String], retention: &Retention) -> anyhow::Result<bool> {
+async fn backup_to(
+    st: &Shared,
+    t: &StoredTarget,
+    object: &str,
+    archive: &[u8],
+    sha: &str,
+    attachments: &[String],
+    retention: &Retention,
+) -> anyhow::Result<bool> {
     let op = t.operator(&st.keys)?;
     targets::write(&op, object, archive.to_vec()).await?;
     let back = targets::read(&op, object).await?;
@@ -217,8 +305,11 @@ async fn backup_to(st: &Shared, t: &StoredTarget, object: &str, archive: &[u8], 
     let done: std::collections::HashSet<String> = st
         .db
         .run(move |c| {
-            let mut s = c.prepare("SELECT attachment_id FROM backup_target_blobs WHERE target_id = ?1")?;
-            let rows = s.query_map([&tid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let mut s =
+                c.prepare("SELECT attachment_id FROM backup_target_blobs WHERE target_id = ?1")?;
+            let rows = s
+                .query_map([&tid], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
             Ok(rows)
         })
         .await?;
@@ -237,7 +328,13 @@ async fn backup_to(st: &Shared, t: &StoredTarget, object: &str, archive: &[u8], 
     if !t.target.protect_mode {
         let objects = targets::list_backups(&op).await?;
         let times: Vec<i64> = objects.iter().map(|o| o.modified_at).collect();
-        let keep = npw_backup::retain(&times, retention.recent as usize, retention.daily as usize, retention.weekly as usize, retention.monthly as usize);
+        let keep = npw_backup::retain(
+            &times,
+            retention.recent as usize,
+            retention.daily as usize,
+            retention.weekly as usize,
+            retention.monthly as usize,
+        );
         for o in objects {
             if o.name != object && !keep.contains(&o.modified_at) {
                 if let Err(e) = targets::delete(&op, &o.name).await {
@@ -263,28 +360,54 @@ pub async fn run_drill(st: &Shared, target_id: Option<String>) -> AppResult<Dril
         Ok((object, detail)) => (true, object, detail),
         Err(e) => (false, String::new(), format!("{e:#}")),
     };
-    let run = DrillRun { id: uuid::Uuid::now_v7().to_string(), at: started, target_id: t.target.id.clone(), object, ok, detail, duration_ms: now_ms() - started };
+    let run = DrillRun {
+        id: uuid::Uuid::now_v7().to_string(),
+        at: started,
+        target_id: t.target.id.clone(),
+        object,
+        ok,
+        detail,
+        duration_ms: now_ms() - started,
+    };
     let r2 = run.clone();
     st.db
         .run(move |c| {
-            c.execute("INSERT INTO drill_runs (id, at, data) VALUES (?1, ?2, ?3)", params![r2.id, r2.at, serde_json::to_string(&r2).map_err(AppError::internal)?])?;
+            c.execute(
+                "INSERT INTO drill_runs (id, at, data) VALUES (?1, ?2, ?3)",
+                params![
+                    r2.id,
+                    r2.at,
+                    serde_json::to_string(&r2).map_err(AppError::internal)?
+                ],
+            )?;
             Ok(())
         })
         .await?;
     if !run.ok {
         let st2 = st.clone();
         let settings = st.db.run(move |c| load_settings(c, &st2)).await?;
-        notify::send(&settings.notify, "NyaPassword 恢复演练失败", &format!("{}: {}", t.target.name, run.detail)).await;
+        notify::send(
+            &settings.notify,
+            "NyaPassword 恢复演练失败",
+            &format!("{}: {}", t.target.name, run.detail),
+        )
+        .await;
     }
     Ok(run)
 }
 
 async fn drill(st: &Shared, t: &StoredTarget) -> anyhow::Result<(String, String)> {
     let op = t.operator(&st.keys)?;
-    let latest = targets::list_backups(&op).await?.into_iter().next().ok_or_else(|| anyhow::anyhow!("the target has no backups"))?;
+    let latest = targets::list_backups(&op)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("the target has no backups"))?;
     let data = targets::read(&op, &latest.name).await?;
-    let (manifest, files) = npw_backup::open(&data, &[st.keys.age_identity.clone()])?;
-    let db_bytes = files.get("db.sqlite3").ok_or_else(|| anyhow::anyhow!("archive has no database"))?;
+    let (manifest, files) = npw_backup::open(&data, std::slice::from_ref(&st.keys.age_identity))?;
+    let db_bytes = files
+        .get("db.sqlite3")
+        .ok_or_else(|| anyhow::anyhow!("archive has no database"))?;
     let dir = tempfile::Builder::new().prefix("drill-").tempdir_in({
         std::fs::create_dir_all(st.cfg.tmp_dir())?;
         st.cfg.tmp_dir()
@@ -292,10 +415,18 @@ async fn drill(st: &Shared, t: &StoredTarget) -> anyhow::Result<(String, String)
     let path = dir.path().join("db.sqlite3");
     std::fs::write(&path, db_bytes)?;
     let (items, revisions, sample) = check_snapshot(&path, &manifest)?;
-    let present: std::collections::HashSet<String> = if sample.is_empty() { Default::default() } else { targets::list_attachments(&op).await?.into_iter().collect() };
+    let present: std::collections::HashSet<String> = if sample.is_empty() {
+        Default::default()
+    } else {
+        targets::list_attachments(&op).await?.into_iter().collect()
+    };
     let missing: Vec<&String> = sample.iter().filter(|a| !present.contains(*a)).collect();
     if !missing.is_empty() {
-        anyhow::bail!("{} of {} sampled attachments are missing on the target", missing.len(), sample.len());
+        anyhow::bail!(
+            "{} of {} sampled attachments are missing on the target",
+            missing.len(),
+            sample.len()
+        );
     }
     Ok((
         latest.name.clone(),
@@ -311,7 +442,10 @@ async fn drill(st: &Shared, t: &StoredTarget) -> anyhow::Result<(String, String)
 }
 
 /// Synchronous checks of a restored database: (items, revisions, sampled attachment ids).
-fn check_snapshot(path: &std::path::Path, manifest: &npw_backup::Manifest) -> anyhow::Result<(i64, i64, Vec<String>)> {
+fn check_snapshot(
+    path: &std::path::Path,
+    manifest: &npw_backup::Manifest,
+) -> anyhow::Result<(i64, i64, Vec<String>)> {
     let c = Connection::open(path)?;
     let integrity: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     if integrity != "ok" {
@@ -320,7 +454,11 @@ fn check_snapshot(path: &std::path::Path, manifest: &npw_backup::Manifest) -> an
     let items: i64 = c.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
     let revisions: i64 = c.query_row("SELECT COUNT(*) FROM item_revisions", [], |r| r.get(0))?;
     if items != manifest.items || revisions != manifest.revisions {
-        anyhow::bail!("counts differ from the manifest: items {items}/{}, revisions {revisions}/{}", manifest.items, manifest.revisions);
+        anyhow::bail!(
+            "counts differ from the manifest: items {items}/{}, revisions {revisions}/{}",
+            manifest.items,
+            manifest.revisions
+        );
     }
     // every item head must point at an existing revision
     let dangling: i64 = c.query_row(
@@ -332,7 +470,9 @@ fn check_snapshot(path: &std::path::Path, manifest: &npw_backup::Manifest) -> an
         anyhow::bail!("{dangling} items point at missing revisions");
     }
     let mut s = c.prepare("SELECT id FROM attachments ORDER BY RANDOM() LIMIT 20")?;
-    let sample: Vec<String> = s.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let sample: Vec<String> = s
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     Ok((items, revisions, sample))
 }
 
@@ -355,12 +495,34 @@ async fn tick(st: &Shared) -> AppResult<()> {
     let (settings, targets, pending, last_run, last_drill, last_success, alerted) = st
         .db
         .run(move |c| {
-            let targets: Vec<StoredTarget> = load_targets(c)?.into_iter().filter(|t| t.target.enabled).collect();
-            let last_run: Option<i64> = c.query_row("SELECT MAX(started_at) FROM backup_runs", [], |r| r.get(0))?;
-            let last_drill: Option<i64> = c.query_row("SELECT MAX(at) FROM drill_runs", [], |r| r.get(0))?;
-            let last_success: Option<i64> = c.query_row("SELECT MAX(last_success_at) FROM backup_target_state", [], |r| r.get(0)).optional()?.flatten();
-            let alerted: i64 = db::get_setting(c, ALERTED_KEY)?.and_then(|v| v.parse().ok()).unwrap_or(0);
-            Ok((load_settings(c, &st2)?, targets, pending_changes(c)?, last_run.unwrap_or(0), last_drill.unwrap_or(0), last_success, alerted))
+            let targets: Vec<StoredTarget> = load_targets(c)?
+                .into_iter()
+                .filter(|t| t.target.enabled)
+                .collect();
+            let last_run: Option<i64> =
+                c.query_row("SELECT MAX(started_at) FROM backup_runs", [], |r| r.get(0))?;
+            let last_drill: Option<i64> =
+                c.query_row("SELECT MAX(at) FROM drill_runs", [], |r| r.get(0))?;
+            let last_success: Option<i64> = c
+                .query_row(
+                    "SELECT MAX(last_success_at) FROM backup_target_state",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let alerted: i64 = db::get_setting(c, ALERTED_KEY)?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            Ok((
+                load_settings(c, &st2)?,
+                targets,
+                pending_changes(c)?,
+                last_run.unwrap_or(0),
+                last_drill.unwrap_or(0),
+                last_success,
+                alerted,
+            ))
         })
         .await?;
     if targets.is_empty() {
@@ -384,8 +546,15 @@ async fn tick(st: &Shared) -> AppResult<()> {
     }
     let stale = last_success.is_none_or(|t| now - t > 26 * hour);
     if stale && now - alerted > 24 * hour && now - st.started_at > hour {
-        notify::send(&settings.notify, "NyaPassword 备份告警", "超过 26 小时没有成功的备份，请检查备份目标。").await;
-        st.db.run(move |c| Ok(db::set_setting(c, ALERTED_KEY, &now.to_string())?)).await?;
+        notify::send(
+            &settings.notify,
+            "NyaPassword 备份告警",
+            "超过 26 小时没有成功的备份，请检查备份目标。",
+        )
+        .await;
+        st.db
+            .run(move |c| Ok(db::set_setting(c, ALERTED_KEY, &now.to_string())?))
+            .await?;
     }
     Ok(())
 }

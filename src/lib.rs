@@ -84,19 +84,33 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/auth/logout", post(auth::logout))
         .route("/v1/account", get(account::get_account))
         .route("/v1/account/password/start", post(account::password_start))
-        .route("/v1/account/password/finish", post(account::password_finish))
+        .route(
+            "/v1/account/password/finish",
+            post(account::password_finish),
+        )
         .route("/v1/account/audit", get(account::audit_log))
         .route("/v1/vaults", post(account::create_vault))
         .route("/v1/vaults/{vault}/meta", put(account::update_vault_meta))
         .route("/v1/vaults/{vault}/changes", get(items::changes))
-        .route("/v1/vaults/{vault}/items/batch", post(items::push).layer(DefaultBodyLimit::max(128 * 1024 * 1024)))
+        .route(
+            "/v1/vaults/{vault}/items/batch",
+            post(items::push).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
         .route("/v1/vaults/{vault}/digest", get(items::digest))
-        .route("/v1/vaults/{vault}/items/{item}/revisions", get(items::revisions))
-        .route("/v1/vaults/{vault}/items/{item}/revisions/{rev}", get(items::revision))
+        .route(
+            "/v1/vaults/{vault}/items/{item}/revisions",
+            get(items::revisions),
+        )
+        .route(
+            "/v1/vaults/{vault}/items/{item}/revisions/{rev}",
+            get(items::revision),
+        )
         .route("/v1/vaults/{vault}/purge", post(items::purge))
         .route(
             "/v1/vaults/{vault}/attachments/{att}",
-            put(items::put_attachment).get(items::get_attachment).layer(DefaultBodyLimit::max(max_att)),
+            put(items::put_attachment)
+                .get(items::get_attachment)
+                .layer(DefaultBodyLimit::max(max_att)),
         )
         .route("/v1/devices", get(account::devices))
         .route("/v1/devices/{device}", delete(account::revoke_device))
@@ -105,16 +119,31 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/admin/health", get(admin::health))
         .route("/v1/admin/accounts", get(admin::accounts))
         .route("/v1/admin/devices/{device}", delete(admin::revoke_device))
-        .route("/v1/admin/invites", get(admin::invites).post(admin::new_invite))
+        .route(
+            "/v1/admin/invites",
+            get(admin::invites).post(admin::new_invite),
+        )
         .route("/v1/admin/audit", get(admin::audit))
         .route("/v1/admin/backup", get(admin::backup_status))
         .route("/v1/admin/backup/settings", put(admin::put_settings))
-        .route("/v1/admin/backup/targets/{id}", put(admin::put_target).delete(admin::delete_target))
-        .route("/v1/admin/backup/targets/{id}/test", post(admin::test_target))
-        .route("/v1/admin/backup/targets/{id}/objects", get(admin::target_objects))
+        .route(
+            "/v1/admin/backup/targets/{id}",
+            put(admin::put_target).delete(admin::delete_target),
+        )
+        .route(
+            "/v1/admin/backup/targets/{id}/test",
+            post(admin::test_target),
+        )
+        .route(
+            "/v1/admin/backup/targets/{id}/objects",
+            get(admin::target_objects),
+        )
         .route("/v1/admin/backup/run", post(admin::run_now))
         .route("/v1/admin/backup/drill", post(admin::drill))
-        .route("/v1/admin/backup/manual-drill", post(admin::manual_drill_done))
+        .route(
+            "/v1/admin/backup/manual-drill",
+            post(admin::manual_drill_done),
+        )
         .route("/v1/admin/notify/test", post(admin::test_notify));
     api.fallback(web::static_handler).with_state(st)
 }
@@ -128,15 +157,24 @@ pub async fn serve(st: Shared) -> anyhow::Result<()> {
 }
 
 /// Serves on an already bound listener until `shutdown` completes.
-pub async fn serve_on(st: Shared, listener: tokio::net::TcpListener, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> anyhow::Result<()> {
+pub async fn serve_on(
+    st: Shared,
+    listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let listen = listener.local_addr()?;
     let sched = tokio::spawn(backup::scheduler(st.clone()));
     let app = router(st).layer(tower_http::trace::TraceLayer::new_for_http());
-    tracing::info!("NyaPassword server {} listening on {listen}", env!("CARGO_PKG_VERSION"));
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    tracing::info!(
+        "NyaPassword server {} listening on {listen}",
+        env!("CARGO_PKG_VERSION")
+    );
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     sched.abort();
     Ok(())
 }
-

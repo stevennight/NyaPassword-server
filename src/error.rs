@@ -15,10 +15,18 @@ pub type AppResult<T> = Result<T, AppError>;
 
 impl AppError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
     }
     pub fn unauthorized() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, code::UNAUTHORIZED, "sign in required")
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            code::UNAUTHORIZED,
+            "sign in required",
+        )
     }
     pub fn forbidden() -> Self {
         Self::new(StatusCode::FORBIDDEN, code::FORBIDDEN, "not allowed")
@@ -33,14 +41,26 @@ impl AppError {
         Self::new(StatusCode::CONFLICT, code::CONFLICT, msg)
     }
     pub fn rate_limited() -> Self {
-        Self::new(StatusCode::TOO_MANY_REQUESTS, code::RATE_LIMITED, "too many attempts, try again later")
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            code::RATE_LIMITED,
+            "too many attempts, try again later",
+        )
     }
     pub fn login_failed() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, code::LOGIN_FAILED, "wrong login, password or Secret Key")
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            code::LOGIN_FAILED,
+            "wrong login, password or Secret Key",
+        )
     }
     pub fn internal(e: impl std::fmt::Display) -> Self {
         tracing::error!("internal error: {e}");
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, code::SERVER, "internal server error")
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            code::SERVER,
+            "internal server error",
+        )
     }
 }
 
@@ -54,7 +74,14 @@ impl std::error::Error for AppError {}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(ApiError { code: self.code.to_string(), message: self.message })).into_response()
+        (
+            self.status,
+            Json(ApiError {
+                code: self.code.to_string(),
+                message: self.message,
+            }),
+        )
+            .into_response()
     }
 }
 

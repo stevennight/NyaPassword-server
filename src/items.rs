@@ -50,7 +50,12 @@ fn record_from_row(r: &rusqlite::Row) -> rusqlite::Result<ItemRecord> {
 
 const RECORD_COLS: &str = "r.item_id, r.revision, r.seq, r.deleted, r.format_major, r.wrapped_key, r.ciphertext, r.hash, r.created_at, r.device_id";
 
-pub async fn changes(State(st): State<Shared>, user: AuthUser, Path(vault_id): Path<String>, Query(q): Query<ChangesQuery>) -> AppResult<Json<api::ChangesResp>> {
+pub async fn changes(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path(vault_id): Path<String>,
+    Query(q): Query<ChangesQuery>,
+) -> AppResult<Json<api::ChangesResp>> {
     let limit = q.limit.clamp(1, 1000);
     let r = st
         .db
@@ -79,17 +84,36 @@ pub async fn changes(State(st): State<Shared>, user: AuthUser, Path(vault_id): P
     Ok(Json(r))
 }
 
-pub async fn digest(State(st): State<Shared>, user: AuthUser, Path(vault_id): Path<String>) -> AppResult<Json<api::DigestResp>> {
+pub async fn digest(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path(vault_id): Path<String>,
+) -> AppResult<Json<api::DigestResp>> {
     let r = st
         .db
         .run(move |c| {
             require_member(c, &vault_id, &user.account_id)?;
-            let vault_seq: i64 = c.query_row("SELECT seq FROM vaults WHERE id = ?1", [&vault_id], |r| r.get(0))?;
-            let mut s = c.prepare_cached("SELECT item_id, revision, deleted, hash FROM items WHERE vault_id = ?1")?;
-            let rows: Vec<(String, i64, bool, String)> =
-                s.query_map([&vault_id], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
-            let digest = api::vault_digest(rows.iter().map(|(i, r, d, h)| (i.as_str(), *r, *d, h.as_str())));
-            Ok(api::DigestResp { digest, count: rows.len() as i64, vault_seq })
+            let vault_seq: i64 =
+                c.query_row("SELECT seq FROM vaults WHERE id = ?1", [&vault_id], |r| {
+                    r.get(0)
+                })?;
+            let mut s = c.prepare_cached(
+                "SELECT item_id, revision, deleted, hash FROM items WHERE vault_id = ?1",
+            )?;
+            let rows: Vec<(String, i64, bool, String)> = s
+                .query_map([&vault_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0, r.get(3)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let digest = api::vault_digest(
+                rows.iter()
+                    .map(|(i, r, d, h)| (i.as_str(), *r, *d, h.as_str())),
+            );
+            Ok(api::DigestResp {
+                digest,
+                count: rows.len() as i64,
+                vault_seq,
+            })
         })
         .await?;
     Ok(Json(r))
@@ -103,15 +127,39 @@ struct Prepared {
 }
 
 /// Applies one write inside the caller's transaction.
-fn apply_one(c: &Connection, vault_id: &str, device_id: &str, p: &Prepared) -> rusqlite::Result<PushResult> {
+fn apply_one(
+    c: &Connection,
+    vault_id: &str,
+    device_id: &str,
+    p: &Prepared,
+) -> rusqlite::Result<PushResult> {
     let it = &p.item;
     // idempotent retries
-    if let Some((item_id, revision, seq)) =
-        c.query_row("SELECT item_id, revision, seq FROM ops WHERE op_id = ?1", [&it.op_id], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?))).optional()?
+    if let Some((item_id, revision, seq)) = c
+        .query_row(
+            "SELECT item_id, revision, seq FROM ops WHERE op_id = ?1",
+            [&it.op_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
     {
-        return Ok(PushResult { op_id: it.op_id.clone(), item_id, status: PushStatus::Ok, revision: Some(revision), seq: Some(seq), current_revision: None, reason: None });
+        return Ok(PushResult {
+            op_id: it.op_id.clone(),
+            item_id,
+            status: PushStatus::Ok,
+            revision: Some(revision),
+            seq: Some(seq),
+            current_revision: None,
+            reason: None,
+        });
     }
-    let current: Option<i64> = c.query_row("SELECT revision FROM items WHERE vault_id = ?1 AND item_id = ?2", [vault_id, &it.item_id], |r| r.get(0)).optional()?;
+    let current: Option<i64> = c
+        .query_row(
+            "SELECT revision FROM items WHERE vault_id = ?1 AND item_id = ?2",
+            [vault_id, &it.item_id],
+            |r| r.get(0),
+        )
+        .optional()?;
     let cur = current.unwrap_or(0);
     if cur != it.base_revision {
         return Ok(PushResult {
@@ -127,9 +175,16 @@ fn apply_one(c: &Connection, vault_id: &str, device_id: &str, p: &Prepared) -> r
     let revision = cur + 1;
     if cur == 0 {
         // re-created after a purge: the tombstone no longer applies
-        c.execute("DELETE FROM purged WHERE vault_id = ?1 AND item_id = ?2", [vault_id, &it.item_id])?;
+        c.execute(
+            "DELETE FROM purged WHERE vault_id = ?1 AND item_id = ?2",
+            [vault_id, &it.item_id],
+        )?;
     }
-    let seq: i64 = c.query_row("UPDATE vaults SET seq = seq + 1 WHERE id = ?1 RETURNING seq", [vault_id], |r| r.get(0))?;
+    let seq: i64 = c.query_row(
+        "UPDATE vaults SET seq = seq + 1 WHERE id = ?1 RETURNING seq",
+        [vault_id],
+        |r| r.get(0),
+    )?;
     let now = now_ms();
     c.execute(
         "INSERT INTO item_revisions (vault_id, item_id, revision, seq, deleted, format_major, wrapped_key, ciphertext, hash, size, device_id, created_at)
@@ -142,14 +197,35 @@ fn apply_one(c: &Connection, vault_id: &str, device_id: &str, p: &Prepared) -> r
         params![vault_id, it.item_id, revision, seq, it.deleted as i64, p.hash, now],
     )?;
     c.execute("INSERT INTO ops (op_id, vault_id, item_id, revision, seq, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![it.op_id, vault_id, it.item_id, revision, seq, now])?;
-    Ok(PushResult { op_id: it.op_id.clone(), item_id: it.item_id.clone(), status: PushStatus::Ok, revision: Some(revision), seq: Some(seq), current_revision: None, reason: None })
+    Ok(PushResult {
+        op_id: it.op_id.clone(),
+        item_id: it.item_id.clone(),
+        status: PushStatus::Ok,
+        revision: Some(revision),
+        seq: Some(seq),
+        current_revision: None,
+        reason: None,
+    })
 }
 
 fn reject(it: &api::PushItem, reason: &str) -> PushResult {
-    PushResult { op_id: it.op_id.clone(), item_id: it.item_id.clone(), status: PushStatus::Rejected, revision: None, seq: None, current_revision: None, reason: Some(reason.into()) }
+    PushResult {
+        op_id: it.op_id.clone(),
+        item_id: it.item_id.clone(),
+        status: PushStatus::Rejected,
+        revision: None,
+        seq: None,
+        current_revision: None,
+        reason: Some(reason.into()),
+    }
 }
 
-pub async fn push(State(st): State<Shared>, user: AuthUser, Path(vault_id): Path<String>, Json(req): Json<api::PushReq>) -> AppResult<Json<api::PushResp>> {
+pub async fn push(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path(vault_id): Path<String>,
+    Json(req): Json<api::PushReq>,
+) -> AppResult<Json<api::PushResp>> {
     if req.items.len() > 1000 {
         return Err(AppError::invalid("at most 1000 items per request"));
     }
@@ -175,7 +251,12 @@ pub async fn push(State(st): State<Shared>, user: AuthUser, Path(vault_id): Path
                 return Err("item too large");
             }
             let hash = api::item_hash(&wk, &ct);
-            Ok(Prepared { item: it.clone(), wk, ct, hash })
+            Ok(Prepared {
+                item: it.clone(),
+                wk,
+                ct,
+                hash,
+            })
         };
         if !seen.insert(it.item_id.clone()) {
             results[i] = Some(reject(&it, "item appears twice in one request"));
@@ -209,20 +290,43 @@ pub async fn push(State(st): State<Shared>, user: AuthUser, Path(vault_id): Path
                     out[*i] = Some(r);
                 }
             }
-            let failed = out.iter().any(|r| r.as_ref().is_some_and(|r| r.status != PushStatus::Ok));
+            let failed = out
+                .iter()
+                .any(|r| r.as_ref().is_some_and(|r| r.status != PushStatus::Ok));
             if atomic && failed {
                 tx.rollback()?;
                 let out: Vec<PushResult> = out
                     .into_iter()
                     .flatten()
-                    .map(|r| if r.status == PushStatus::Ok { PushResult { status: PushStatus::Rejected, revision: None, seq: None, reason: Some("batch aborted".into()), ..r } } else { r })
+                    .map(|r| {
+                        if r.status == PushStatus::Ok {
+                            PushResult {
+                                status: PushStatus::Rejected,
+                                revision: None,
+                                seq: None,
+                                reason: Some("batch aborted".into()),
+                                ..r
+                            }
+                        } else {
+                            r
+                        }
+                    })
                     .collect();
-                let seq: i64 = c.query_row("SELECT seq FROM vaults WHERE id = ?1", [&vid], |r| r.get(0))?;
+                let seq: i64 =
+                    c.query_row("SELECT seq FROM vaults WHERE id = ?1", [&vid], |r| r.get(0))?;
                 return Ok((out, seq, vec![], 0));
             }
-            let seq: i64 = tx.query_row("SELECT seq FROM vaults WHERE id = ?1", [&vid], |r| r.get(0))?;
+            let seq: i64 =
+                tx.query_row("SELECT seq FROM vaults WHERE id = ?1", [&vid], |r| r.get(0))?;
             if wrote > 0 && atomic {
-                db::audit(&tx, Some(&user.account_id), "import", &user.device_id, &user.ip, &format!("{wrote} items"))?;
+                db::audit(
+                    &tx,
+                    Some(&user.account_id),
+                    "import",
+                    &user.device_id,
+                    &user.ip,
+                    &format!("{wrote} items"),
+                )?;
             }
             tx.commit()?;
             let accounts = vault_accounts(c, &vid)?;
@@ -231,14 +335,24 @@ pub async fn push(State(st): State<Shared>, user: AuthUser, Path(vault_id): Path
         .await?;
     if wrote > 0 {
         for a in accounts {
-            let _ = st.events.send((a, api::Event::VaultChanged { vault_id: vault_id.clone(), seq: vault_seq }));
+            let _ = st.events.send((
+                a,
+                api::Event::VaultChanged {
+                    vault_id: vault_id.clone(),
+                    seq: vault_seq,
+                },
+            ));
         }
         st.notify_change();
     }
     Ok(Json(api::PushResp { results, vault_seq }))
 }
 
-pub async fn revisions(State(st): State<Shared>, user: AuthUser, Path((vault_id, item_id)): Path<(String, String)>) -> AppResult<Json<api::RevisionsResp>> {
+pub async fn revisions(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path((vault_id, item_id)): Path<(String, String)>,
+) -> AppResult<Json<api::RevisionsResp>> {
     let r = st
         .db
         .run(move |c| {
@@ -258,7 +372,11 @@ pub async fn revisions(State(st): State<Shared>, user: AuthUser, Path((vault_id,
     Ok(Json(r))
 }
 
-pub async fn revision(State(st): State<Shared>, user: AuthUser, Path((vault_id, item_id, rev)): Path<(String, String, i64)>) -> AppResult<Json<ItemRecord>> {
+pub async fn revision(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path((vault_id, item_id, rev)): Path<(String, String, i64)>,
+) -> AppResult<Json<ItemRecord>> {
     let r = st
         .db
         .run(move |c| {
@@ -270,7 +388,12 @@ pub async fn revision(State(st): State<Shared>, user: AuthUser, Path((vault_id, 
     Ok(Json(r))
 }
 
-pub async fn purge(State(st): State<Shared>, user: AuthUser, Path(vault_id): Path<String>, Json(req): Json<api::PurgeReq>) -> AppResult<Json<api::PurgeResp>> {
+pub async fn purge(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path(vault_id): Path<String>,
+    Json(req): Json<api::PurgeReq>,
+) -> AppResult<Json<api::PurgeResp>> {
     let att_dir = st.cfg.attachments_dir();
     let vid = vault_id.clone();
     let (purged, files) = st
@@ -338,18 +461,39 @@ pub async fn put_attachment(
         .db
         .run(move |c| {
             require_member(c, &v, &uid)?;
-            Ok(c.query_row("SELECT sha256 FROM attachments WHERE id = ?1", [&a], |r| r.get::<_, String>(0)).optional()?)
+            Ok(
+                c.query_row("SELECT sha256 FROM attachments WHERE id = ?1", [&a], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?,
+            )
         })
         .await?;
     match existing {
-        Some(s) if s == sha => return Ok(Json(api::AttachmentInfo { id: att_id, size: body.len() as i64, sha256: sha })),
-        Some(_) => return Err(AppError::conflict("attachment exists with different content")),
+        Some(s) if s == sha => {
+            return Ok(Json(api::AttachmentInfo {
+                id: att_id,
+                size: body.len() as i64,
+                sha256: sha,
+            }))
+        }
+        Some(_) => {
+            return Err(AppError::conflict(
+                "attachment exists with different content",
+            ))
+        }
         None => {}
     }
-    tokio::fs::create_dir_all(&dir).await.map_err(AppError::internal)?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(AppError::internal)?;
     let tmp = dir.join(format!("{att_id}.part"));
-    tokio::fs::write(&tmp, &body).await.map_err(AppError::internal)?;
-    tokio::fs::rename(&tmp, dir.join(&att_id)).await.map_err(AppError::internal)?;
+    tokio::fs::write(&tmp, &body)
+        .await
+        .map_err(AppError::internal)?;
+    tokio::fs::rename(&tmp, dir.join(&att_id))
+        .await
+        .map_err(AppError::internal)?;
     let size = body.len() as i64;
     let (a, s2) = (att_id.clone(), sha.clone());
     st.db
@@ -362,18 +506,34 @@ pub async fn put_attachment(
         })
         .await?;
     st.notify_change();
-    Ok(Json(api::AttachmentInfo { id: att_id, size, sha256: sha }))
+    Ok(Json(api::AttachmentInfo {
+        id: att_id,
+        size,
+        sha256: sha,
+    }))
 }
 
-pub async fn get_attachment(State(st): State<Shared>, user: AuthUser, Path((vault_id, att_id)): Path<(String, String)>) -> AppResult<impl IntoResponse> {
+pub async fn get_attachment(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path((vault_id, att_id)): Path<(String, String)>,
+) -> AppResult<impl IntoResponse> {
     let a = att_id.clone();
     st.db
         .run(move |c| {
             require_member(c, &vault_id, &user.account_id)?;
-            c.query_row("SELECT 1 FROM attachments WHERE id = ?1 AND vault_id = ?2", [&a, &vault_id], |_| Ok(())).optional()?.ok_or_else(AppError::not_found)
+            c.query_row(
+                "SELECT 1 FROM attachments WHERE id = ?1 AND vault_id = ?2",
+                [&a, &vault_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .ok_or_else(AppError::not_found)
         })
         .await?;
-    let data = tokio::fs::read(st.cfg.attachments_dir().join(&att_id)).await.map_err(|_| AppError::not_found())?;
+    let data = tokio::fs::read(st.cfg.attachments_dir().join(&att_id))
+        .await
+        .map_err(|_| AppError::not_found())?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], data))
 }
 
@@ -382,11 +542,17 @@ pub fn counts(c: &Connection) -> rusqlite::Result<HashMap<&'static str, i64>> {
     let mut m = HashMap::new();
     for (k, sql) in [
         ("accounts", "SELECT COUNT(*) FROM accounts"),
-        ("devices", "SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL"),
+        (
+            "devices",
+            "SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL",
+        ),
         ("items", "SELECT COUNT(*) FROM items"),
         ("revisions", "SELECT COUNT(*) FROM item_revisions"),
         ("attachments", "SELECT COUNT(*) FROM attachments"),
-        ("attachment_bytes", "SELECT COALESCE(SUM(size), 0) FROM attachments"),
+        (
+            "attachment_bytes",
+            "SELECT COALESCE(SUM(size), 0) FROM attachments",
+        ),
     ] {
         m.insert(k, c.query_row(sql, [], |r| r.get(0))?);
     }

@@ -48,7 +48,12 @@ pub struct RestoreArgs {
     #[arg(long, default_value = "")]
     pub username: String,
     /// OSS access key secret / WebDAV password (or set NYAPASSWORD_RESTORE_SECRET).
-    #[arg(long, env = "NYAPASSWORD_RESTORE_SECRET", default_value = "", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "NYAPASSWORD_RESTORE_SECRET",
+        default_value = "",
+        hide_env_values = true
+    )]
     pub secret: String,
 }
 
@@ -67,7 +72,9 @@ pub async fn run(args: RestoreArgs, default_dir: PathBuf) -> anyhow::Result<()> 
                 Some("oss") => TargetKind::Oss,
                 Some("webdav") => TargetKind::Webdav,
                 Some("fs") => TargetKind::Fs,
-                _ => anyhow::bail!("give --file, or --kind oss|webdav|fs with --endpoint (and --bucket for OSS)"),
+                _ => anyhow::bail!(
+                    "give --file, or --kind oss|webdav|fs with --endpoint (and --bucket for OSS)"
+                ),
             };
             let target = StoredTarget {
                 target: BackupTarget {
@@ -76,7 +83,10 @@ pub async fn run(args: RestoreArgs, default_dir: PathBuf) -> anyhow::Result<()> 
                     name: "restore".into(),
                     enabled: true,
                     protect_mode: true,
-                    endpoint: args.endpoint.clone().ok_or_else(|| anyhow::anyhow!("--endpoint is required"))?,
+                    endpoint: args
+                        .endpoint
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("--endpoint is required"))?,
                     bucket: args.bucket.clone().unwrap_or_default(),
                     root: args.root.clone(),
                     username: args.username.clone(),
@@ -86,15 +96,25 @@ pub async fn run(args: RestoreArgs, default_dir: PathBuf) -> anyhow::Result<()> 
                 secret_sealed: String::new(),
             };
             // a throwaway key just to hold the secret for the operator
-            let tmp_keys = ServerKeys { secret: npw_crypto::b64(npw_crypto::Key32::generate().as_bytes()), age_identity: identity.clone(), created_at: 0 };
-            let target = StoredTarget { secret_sealed: tmp_keys.seal("target:restore", &args.secret), ..target };
+            let tmp_keys = ServerKeys {
+                secret: npw_crypto::b64(npw_crypto::Key32::generate().as_bytes()),
+                age_identity: identity.clone(),
+                created_at: 0,
+            };
+            let target = StoredTarget {
+                secret_sealed: tmp_keys.seal("target:restore", &args.secret),
+                ..target
+            };
             let op = target.operator(&tmp_keys)?;
             let object = match &args.object {
                 Some(o) => o.clone(),
                 None => {
                     let list = targets::list_backups(&op).await?;
                     println!("backups on the target: {}", list.len());
-                    list.first().ok_or_else(|| anyhow::anyhow!("no backups found on the target"))?.name.clone()
+                    list.first()
+                        .ok_or_else(|| anyhow::anyhow!("no backups found on the target"))?
+                        .name
+                        .clone()
                 }
             };
             println!("downloading {object}");
@@ -103,9 +123,15 @@ pub async fn run(args: RestoreArgs, default_dir: PathBuf) -> anyhow::Result<()> 
     };
 
     let (manifest, files) = npw_backup::open(&data, &[identity])?;
-    println!("backup created:    {}", npw_backup::utc_stamp(manifest.created_at));
+    println!(
+        "backup created:    {}",
+        npw_backup::utc_stamp(manifest.created_at)
+    );
     println!("server version:    {}", manifest.server_version);
-    println!("accounts / items / revisions / attachments: {} / {} / {} / {}", manifest.accounts, manifest.items, manifest.revisions, manifest.attachments);
+    println!(
+        "accounts / items / revisions / attachments: {} / {} / {} / {}",
+        manifest.accounts, manifest.items, manifest.revisions, manifest.attachments
+    );
     for (v, seq) in &manifest.vaults {
         println!("vault {v}: seq {seq}");
     }
@@ -113,13 +139,22 @@ pub async fn run(args: RestoreArgs, default_dir: PathBuf) -> anyhow::Result<()> 
     // verify the database before touching anything
     let tmp = tempfile::tempdir()?;
     let probe = tmp.path().join("db.sqlite3");
-    std::fs::write(&probe, files.get("db.sqlite3").ok_or_else(|| anyhow::anyhow!("archive has no database"))?)?;
+    std::fs::write(
+        &probe,
+        files
+            .get("db.sqlite3")
+            .ok_or_else(|| anyhow::anyhow!("archive has no database"))?,
+    )?;
     {
         let c = Connection::open(&probe)?;
         let ok: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         anyhow::ensure!(ok == "ok", "database integrity_check failed: {ok}");
         let items: i64 = c.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
-        anyhow::ensure!(items == manifest.items, "item count {items} differs from the manifest {}", manifest.items);
+        anyhow::ensure!(
+            items == manifest.items,
+            "item count {items} differs from the manifest {}",
+            manifest.items
+        );
     }
     println!("verified: decrypts, integrity_check ok, counts match the manifest");
     if args.dry_run {
@@ -131,10 +166,22 @@ pub async fn run(args: RestoreArgs, default_dir: PathBuf) -> anyhow::Result<()> 
     std::fs::create_dir_all(&dir)?;
     let db_path = dir.join("nyapassword.sqlite3");
     if db_path.exists() {
-        anyhow::ensure!(args.replace, "{} already has a database; pass --replace to move it aside", dir.display());
-        let aside = dir.join(format!("pre-restore-{}", npw_backup::utc_stamp(crate::db::now_ms())));
+        anyhow::ensure!(
+            args.replace,
+            "{} already has a database; pass --replace to move it aside",
+            dir.display()
+        );
+        let aside = dir.join(format!(
+            "pre-restore-{}",
+            npw_backup::utc_stamp(crate::db::now_ms())
+        ));
         std::fs::create_dir_all(&aside)?;
-        for name in ["nyapassword.sqlite3", "nyapassword.sqlite3-wal", "nyapassword.sqlite3-shm", "server.key"] {
+        for name in [
+            "nyapassword.sqlite3",
+            "nyapassword.sqlite3-wal",
+            "nyapassword.sqlite3-shm",
+            "server.key",
+        ] {
             let p = dir.join(name);
             if p.exists() {
                 std::fs::rename(&p, aside.join(name))?;

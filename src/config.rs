@@ -47,9 +47,15 @@ impl Default for Config {
 
 impl Config {
     pub fn load(data_dir: Option<PathBuf>) -> anyhow::Result<Self> {
-        let dir = data_dir.or_else(|| std::env::var_os("NYAPASSWORD_DATA").map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("data"));
+        let dir = data_dir
+            .or_else(|| std::env::var_os("NYAPASSWORD_DATA").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("data"));
         let file = dir.join("config.toml");
-        let mut cfg: Config = if file.exists() { toml::from_str(&std::fs::read_to_string(&file)?)? } else { Config::default() };
+        let mut cfg: Config = if file.exists() {
+            toml::from_str(&std::fs::read_to_string(&file)?)?
+        } else {
+            Config::default()
+        };
         cfg.data_dir = dir;
         if let Ok(v) = std::env::var("NYAPASSWORD_LISTEN") {
             cfg.listen = v.parse()?;

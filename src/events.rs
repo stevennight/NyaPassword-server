@@ -16,7 +16,11 @@ pub struct EventsQuery {
     token: String,
 }
 
-pub async fn events(State(st): State<Shared>, Query(q): Query<EventsQuery>, ws: WebSocketUpgrade) -> AppResult<Response> {
+pub async fn events(
+    State(st): State<Shared>,
+    Query(q): Query<EventsQuery>,
+    ws: WebSocketUpgrade,
+) -> AppResult<Response> {
     let user = authenticate(&st, &q.token).await?;
     Ok(ws.on_upgrade(move |socket| run(st, user.account_id, user.device_id, socket)))
 }
