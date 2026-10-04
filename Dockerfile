@@ -51,7 +51,7 @@ FROM alpine:3.22
 RUN apk add --no-cache su-exec tzdata ca-certificates \
     && adduser -D -H -u 10001 nyapassword
 COPY --from=build /nyapassword-server /usr/local/bin/nyapassword-server
-COPY server/deploy/docker/entrypoint.sh /entrypoint.sh
+COPY --chmod=0755 server/deploy/docker/entrypoint.sh /entrypoint.sh
 ENV NYAPASSWORD_DATA=/data \
     NYAPASSWORD_LISTEN=0.0.0.0:8087
 VOLUME /data
