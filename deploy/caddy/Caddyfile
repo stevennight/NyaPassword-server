@@ -1,0 +1,9 @@
+# Caddy in front of NyaPassword: automatic HTTPS, WebSocket passthrough.
+vault.example.com {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+	reverse_proxy 127.0.0.1:8087
+}

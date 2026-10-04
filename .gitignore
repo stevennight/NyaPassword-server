@@ -1,0 +1,10 @@
+/target
+/webdist/
+/data/
+/release/
+*.log
+deploy/docker/.env
+deploy/docker/data/
+*.key
+.idea/
+.vscode/

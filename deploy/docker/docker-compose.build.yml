@@ -1,0 +1,8 @@
+# Build the image locally instead of pulling it (run from deploy/docker):
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+services:
+  nyapassword:
+    image: nyapassword-server:local
+    build:
+      context: ../../..
+      dockerfile: server/Dockerfile

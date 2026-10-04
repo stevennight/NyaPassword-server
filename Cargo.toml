@@ -1,0 +1,64 @@
+[package]
+name = "nyapassword-server"
+description = "NyaPassword sync server: end-to-end encrypted vault storage, sessions, automatic backups"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+default-run = "nyapassword-server"
+
+[[bin]]
+name = "nyapassword-server"
+path = "src/main.rs"
+
+[dependencies]
+# Shared crates from the common repository, checked out next to this one
+# (CI does the same; a release pins the commit in COMMON_REF).
+npw-api = { path = "../common/crates/npw-api" }
+npw-crypto = { path = "../common/crates/npw-crypto" }
+npw-backup = { path = "../common/crates/npw-backup" }
+npw-otp = { path = "../common/crates/npw-otp" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "net"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["limit", "trace", "set-header"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+hex = "0.4"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+opendal = { version = "0.53", features = ["services-oss", "services-webdav", "services-fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-rustls-tls", "builder", "hostname"] }
+futures-util = "0.3"
+bytes = "1"
+tempfile = "3"
+
+[dev-dependencies]
+npw-core = { path = "../common/crates/npw-core" }
+npw-model = { path = "../common/crates/npw-model" }
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+[profile.test.package."*"]
+opt-level = 2

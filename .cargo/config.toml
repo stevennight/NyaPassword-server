@@ -1,0 +1,12 @@
+# common / server / desktop / android share one target directory so the common crates build once.
+[build]
+target-dir = "../target"
+
+# Link the C runtime statically: target machines don't need the VC++ redistributable.
+# Keep identical in all repositories (different flags would force rebuilds).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# getrandom 0.2 needs the JS backend on wasm32-unknown-unknown (the browser extension and the web vault).
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

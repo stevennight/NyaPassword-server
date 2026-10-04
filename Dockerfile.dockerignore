@@ -1,0 +1,14 @@
+# Context is the parent directory (server/ and common/ side by side).
+*
+!common/
+!server/
+**/target
+**/node_modules
+**/.git
+common/web/dist
+server/webdist
+server/data
+server/release
+server/deploy/docker/.env
+server/deploy/docker/data
+**/*.key
