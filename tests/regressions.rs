@@ -902,3 +902,83 @@ async fn concurrent_writes_do_not_force_a_full_reconcile() {
     assert_eq!(all_ids(&b).len(), 3);
     srv.stop().await;
 }
+
+// ------------------------------------------------------------------ 14. signing out with an unresponsive server
+
+/// Sends to the real server until `hang` is set, then to a socket that accepts
+/// connections and never answers.
+struct HangTransport {
+    real: ReqwestTransport,
+    hole: ReqwestTransport,
+    hang: Arc<AtomicBool>,
+}
+
+impl Transport for HangTransport {
+    fn send<'a, 'b>(
+        &'a self,
+        req: HttpRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, CoreError>> + Send + 'b>>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        Box::pin(async move {
+            if self.hang.load(Ordering::SeqCst) {
+                self.hole.send(req).await
+            } else {
+                self.real.send(req).await
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_out_does_not_wait_for_an_unresponsive_server() {
+    let srv = TestServer::start().await;
+    let (_a, sk, _vault) = registered(&srv).await;
+
+    // a "server" that accepts and never answers
+    let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hole_url = format!("http://{}", hole.local_addr().unwrap());
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let h2 = held.clone();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = hole.accept().await {
+            h2.lock().unwrap().push(s);
+        }
+    });
+
+    let hang = Arc::new(AtomicBool::new(false));
+    let (hang2, hole2) = (hang.clone(), hole_url.clone());
+    let mut cfg = ClientConfig::new("B", "cli", "test");
+    cfg.allow_weak_kdf = true;
+    let b = Client::with_transport_factory(
+        cfg,
+        Arc::new(MemoryStore::new()),
+        Key32::from_bytes([7u8; 32]),
+        Box::new(move |url| {
+            Ok(Arc::new(HangTransport {
+                real: ReqwestTransport::new(url)?,
+                hole: ReqwestTransport::new(&hole2)?,
+                hang: hang2.clone(),
+            }) as Arc<dyn Transport>)
+        }),
+    )
+    .unwrap();
+    b.sign_in(&srv.url, "me@example.com", "pw", &sk)
+        .await
+        .unwrap();
+    b.sync().await.unwrap();
+
+    hang.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    b.sign_out(false).await.unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "sign-out waited {took:?} for the server"
+    );
+    assert!(!b.lock_state().signed_in, "signed out locally");
+    assert!(!held.lock().unwrap().is_empty(), "the logout was attempted");
+    srv.stop().await;
+}
