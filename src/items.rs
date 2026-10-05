@@ -70,11 +70,17 @@ pub async fn changes(
             let items = s.query_map(params![vault_id, q.since, limit], record_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
             let has_more = items.len() as i64 == limit;
             let next_seq = items.last().map(|r| r.seq).unwrap_or(q.since.min(vault_seq));
-            let purged = if has_more {
-                vec![]
-            } else {
-                let mut s = c.prepare_cached("SELECT item_id FROM purged WHERE vault_id = ?1 AND seq > ?2")?;
-                let rows = s.query_map(params![vault_id, q.since], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+            // Tombstones go with the page whose sequence range holds them: (since, next_seq]
+            // for a full page, everything after `since` for the last one. Pages fetched one
+            // after another (each `since` = the previous `next_seq`) thus deliver every
+            // tombstone exactly once.
+            let purged = {
+                let mut s = c.prepare_cached(
+                    "SELECT item_id FROM purged WHERE vault_id = ?1 AND seq > ?2 AND (?3 = 0 OR seq <= ?4) ORDER BY seq",
+                )?;
+                let rows = s
+                    .query_map(params![vault_id, q.since, has_more as i64, next_seq], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
                 rows
             };
             let next_seq = if has_more { next_seq } else { vault_seq.max(next_seq) };
@@ -130,19 +136,23 @@ struct Prepared {
 fn apply_one(
     c: &Connection,
     vault_id: &str,
-    device_id: &str,
+    user: &AuthUser,
     p: &Prepared,
 ) -> rusqlite::Result<PushResult> {
     let it = &p.item;
-    // idempotent retries
+    // idempotent retries: the same operation of the same account in the same vault
     if let Some((item_id, revision, seq)) = c
         .query_row(
-            "SELECT item_id, revision, seq FROM ops WHERE op_id = ?1",
-            [&it.op_id],
+            "SELECT item_id, revision, seq FROM ops WHERE vault_id = ?1 AND account_id = ?2 AND op_id = ?3",
+            [vault_id, &user.account_id, &it.op_id],
             |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?
     {
+        if item_id != it.item_id {
+            // never report a write as done when it was a different item's
+            return Ok(reject(it, "op id already used for another item"));
+        }
         return Ok(PushResult {
             op_id: it.op_id.clone(),
             item_id,
@@ -189,14 +199,17 @@ fn apply_one(
     c.execute(
         "INSERT INTO item_revisions (vault_id, item_id, revision, seq, deleted, format_major, wrapped_key, ciphertext, hash, size, device_id, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![vault_id, it.item_id, revision, seq, it.deleted as i64, it.format_major as i64, p.wk, p.ct, p.hash, (p.wk.len() + p.ct.len()) as i64, device_id, now],
+        params![vault_id, it.item_id, revision, seq, it.deleted as i64, it.format_major as i64, p.wk, p.ct, p.hash, (p.wk.len() + p.ct.len()) as i64, user.device_id, now],
     )?;
     c.execute(
         "INSERT INTO items (vault_id, item_id, revision, seq, deleted, hash, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(vault_id, item_id) DO UPDATE SET revision = excluded.revision, seq = excluded.seq, deleted = excluded.deleted, hash = excluded.hash, updated_at = excluded.updated_at",
         params![vault_id, it.item_id, revision, seq, it.deleted as i64, p.hash, now],
     )?;
-    c.execute("INSERT INTO ops (op_id, vault_id, item_id, revision, seq, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![it.op_id, vault_id, it.item_id, revision, seq, now])?;
+    c.execute(
+        "INSERT INTO ops (vault_id, account_id, op_id, item_id, revision, seq, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![vault_id, user.account_id, it.op_id, it.item_id, revision, seq, now],
+    )?;
     Ok(PushResult {
         op_id: it.op_id.clone(),
         item_id: it.item_id.clone(),
@@ -283,7 +296,7 @@ pub async fn push(
                 }
             } else {
                 for (i, p) in &prepared {
-                    let r = apply_one(&tx, &vid, &user.device_id, p)?;
+                    let r = apply_one(&tx, &vid, &user, p)?;
                     if r.status == PushStatus::Ok {
                         wrote += 1;
                     }
@@ -396,7 +409,7 @@ pub async fn purge(
 ) -> AppResult<Json<api::PurgeResp>> {
     let att_dir = st.cfg.attachments_dir();
     let vid = vault_id.clone();
-    let (purged, files) = st
+    let (purged, files, vault_seq, accounts) = st
         .db
         .run(move |c| {
             require_member(c, &vid, &user.account_id)?;
@@ -425,12 +438,26 @@ pub async fn purge(
             if !purged.is_empty() {
                 db::audit(&tx, Some(&user.account_id), "purge", &user.device_id, &user.ip, &format!("{} items", purged.len()))?;
             }
+            let seq: i64 = tx.query_row("SELECT seq FROM vaults WHERE id = ?1", [&vid], |r| r.get(0))?;
             tx.commit()?;
-            Ok((purged, files))
+            let accounts = vault_accounts(c, &vid)?;
+            Ok((purged, files, seq, accounts))
         })
         .await?;
     for f in files {
         let _ = tokio::fs::remove_file(att_dir.join(&f)).await;
+    }
+    if !purged.is_empty() {
+        // other devices drop the items on their next sync
+        for a in accounts {
+            let _ = st.events.send((
+                a,
+                api::Event::VaultChanged {
+                    vault_id: vault_id.clone(),
+                    seq: vault_seq,
+                },
+            ));
+        }
     }
     st.notify_change();
     Ok(Json(api::PurgeResp { purged }))
@@ -454,63 +481,102 @@ pub async fn put_attachment(
         return Err(AppError::invalid("empty attachment"));
     }
     let sha = npw_crypto::sha256_hex(&body);
+    let size = body.len() as i64;
     let dir = st.cfg.attachments_dir();
-    let (v, a) = (vault_id.clone(), att_id.clone());
-    let uid = user.account_id.clone();
-    let existing = st
-        .db
+    let (v, a, uid) = (vault_id.clone(), att_id.clone(), user.account_id.clone());
+    let s2 = sha.clone();
+    // Cheap early answer for retries and refusals before writing anything.
+    st.db
         .run(move |c| {
             require_member(c, &v, &uid)?;
-            Ok(
-                c.query_row("SELECT sha256 FROM attachments WHERE id = ?1", [&a], |r| {
-                    r.get::<_, String>(0)
-                })
-                .optional()?,
-            )
+            check_existing_attachment(c, &a, &v, &s2).map(|_| ())
         })
         .await?;
-    match existing {
-        Some(s) if s == sha => {
-            return Ok(Json(api::AttachmentInfo {
-                id: att_id,
-                size: body.len() as i64,
-                sha256: sha,
-            }))
-        }
-        Some(_) => {
-            return Err(AppError::conflict(
-                "attachment exists with different content",
-            ))
-        }
-        None => {}
-    }
+
+    // Write to a file of our own, read it back and verify, then (under the database
+    // lock, so concurrent uploads of the same ID are serialized) either find the ID
+    // already recorded or atomically move the file into place and record it.
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(AppError::internal)?;
-    let tmp = dir.join(format!("{att_id}.part"));
-    tokio::fs::write(&tmp, &body)
-        .await
-        .map_err(AppError::internal)?;
-    tokio::fs::rename(&tmp, dir.join(&att_id))
-        .await
-        .map_err(AppError::internal)?;
-    let size = body.len() as i64;
-    let (a, s2) = (att_id.clone(), sha.clone());
-    st.db
+    let tmp = dir.join(format!("{att_id}.{}.part", uuid::Uuid::new_v4()));
+    let written = write_verified(&tmp, &body, &sha).await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    let (a, s2, t2) = (att_id.clone(), sha.clone(), tmp.clone());
+    let fin = dir.join(&att_id);
+    let stored = st
+        .db
         .run(move |c| {
-            c.execute(
+            let tx = c.transaction()?;
+            if check_existing_attachment(&tx, &a, &vault_id, &s2)? {
+                return Ok(false); // stored meanwhile by an identical upload
+            }
+            std::fs::rename(&t2, &fin).map_err(AppError::internal)?;
+            tx.execute(
                 "INSERT INTO attachments (id, vault_id, item_id, size, sha256, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![a, vault_id, q.item, size, s2, now_ms()],
             )?;
-            Ok(())
+            tx.commit()?;
+            Ok(true)
         })
-        .await?;
+        .await;
+    if !matches!(stored, Ok(true)) {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    stored?;
     st.notify_change();
     Ok(Json(api::AttachmentInfo {
         id: att_id,
         size,
         sha256: sha,
     }))
+}
+
+/// `Ok(true)`: this attachment ID is already stored in this vault with this content
+/// (an idempotent retry). `Ok(false)`: not stored yet. Same ID with other content or
+/// in another vault: conflict (blobs are immutable, IDs are global).
+fn check_existing_attachment(
+    c: &Connection,
+    att_id: &str,
+    vault_id: &str,
+    sha: &str,
+) -> AppResult<bool> {
+    let row: Option<(String, String)> = c
+        .query_row(
+            "SELECT vault_id, sha256 FROM attachments WHERE id = ?1",
+            [att_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(false),
+        Some((v, s)) if v == vault_id && s == sha => Ok(true),
+        Some(_) => Err(AppError::conflict(
+            "attachment exists with different content",
+        )),
+    }
+}
+
+/// Writes `data` to `path`, flushes it to disk and reads it back to compare checksums.
+async fn write_verified(path: &std::path::Path, data: &Bytes, sha: &str) -> AppResult<()> {
+    let (path, data, sha) = (path.to_path_buf(), data.clone(), sha.to_string());
+    tokio::task::spawn_blocking(move || -> AppResult<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).map_err(AppError::internal)?;
+        f.write_all(&data).map_err(AppError::internal)?;
+        f.sync_all().map_err(AppError::internal)?;
+        drop(f);
+        let back = std::fs::read(&path).map_err(AppError::internal)?;
+        if npw_crypto::sha256_hex(&back) != sha {
+            return Err(AppError::internal("attachment write verification failed"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(AppError::internal)?
 }
 
 pub async fn get_attachment(

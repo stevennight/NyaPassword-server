@@ -51,7 +51,27 @@ fn uuid_ok(s: &str) -> AppResult<[u8; 16]> {
         .map_err(|_| AppError::invalid("bad id"))
 }
 
+pub fn device_revoked() -> AppError {
+    AppError::new(
+        StatusCode::UNAUTHORIZED,
+        code::DEVICE_REVOKED,
+        "device removed",
+    )
+}
+
+/// Account salts are 16 bytes; accept up to 64 for future use.
+pub fn check_salt(salt: &str) -> AppResult<()> {
+    let s = d64(salt)?;
+    if !(16..=64).contains(&s.len()) {
+        return Err(AppError::invalid("bad account salt length"));
+    }
+    Ok(())
+}
+
 /// Creates a device (or reuses the caller's existing one) and a session.
+/// A device that was revoked stays revoked: signing in again while presenting
+/// its ID is refused (`device_revoked`), so a lost device that is still
+/// unlocked cannot silently come back.
 fn issue_session(
     c: &rusqlite::Connection,
     account_id: &str,
@@ -59,13 +79,20 @@ fn issue_session(
 ) -> AppResult<api::Session> {
     let now = now_ms();
     let reuse = match &device.id {
-        Some(id) => c
-            .query_row(
-                "SELECT id FROM devices WHERE id = ?1 AND account_id = ?2 AND revoked_at IS NULL",
-                [id, account_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?,
+        Some(id) => {
+            let row: Option<(String, Option<i64>)> = c
+                .query_row(
+                    "SELECT id, revoked_at FROM devices WHERE id = ?1 AND account_id = ?2",
+                    [id, account_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match row {
+                Some((_, Some(_))) => return Err(device_revoked()),
+                Some((id, None)) => Some(id),
+                None => None,
+            }
+        }
         None => None,
     };
     let device_id = match reuse {
@@ -190,10 +217,22 @@ fn check_invite(
     }
 }
 
+/// Registration and prelogin are limited per IP like login (`login_start`).
+fn limit_ip(st: &Shared, kind: &str, ip: &str) -> AppResult<()> {
+    if st.limiter.hit(&format!("{kind}-ip:{ip}"), 30, 60_000) {
+        Ok(())
+    } else {
+        Err(AppError::rate_limited())
+    }
+}
+
 pub async fn register_start(
     State(st): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<api::RegisterStartReq>,
 ) -> AppResult<Json<api::OpaqueResp>> {
+    limit_ip(&st, "register", &client_ip(&st, &headers, Some(peer)))?;
     if !valid_login(&req.login) {
         return Err(AppError::invalid("invalid login"));
     }
@@ -215,6 +254,7 @@ pub async fn register_finish(
     headers: HeaderMap,
     Json(req): Json<api::RegisterFinishReq>,
 ) -> AppResult<Json<api::Session>> {
+    limit_ip(&st, "register", &client_ip(&st, &headers, Some(peer)))?;
     if !valid_login(&req.login) {
         return Err(AppError::invalid("invalid login"));
     }
@@ -223,6 +263,7 @@ pub async fn register_finish(
     if !st.cfg.allow_weak_kdf {
         req.kdf.validate()?;
     }
+    check_salt(&req.account_salt)?;
     let record = opaque::server_register_finish(&d64(&req.opaque_upload)?)?;
     for v in [
         &req.account_salt,
@@ -298,8 +339,18 @@ fn fake_account(st: &Shared, login: &str) -> (String, String) {
 
 pub async fn prelogin(
     State(st): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<api::PreloginReq>,
 ) -> AppResult<Json<api::PreloginResp>> {
+    limit_ip(&st, "prelogin", &client_ip(&st, &headers, Some(peer)))?;
+    if !st.limiter.hit(
+        &format!("prelogin:{}", req.login.trim().to_lowercase()),
+        20,
+        3_600_000,
+    ) {
+        return Err(AppError::rate_limited());
+    }
     let login = req.login.trim().to_string();
     let row = st
         .db
@@ -506,7 +557,7 @@ pub async fn refresh(
             let revoked: Option<i64> = tx.query_row("SELECT revoked_at FROM devices WHERE id = ?1", [&device_id], |r| r.get(0))?;
             if revoked.is_some() {
                 tx.commit()?;
-                return Err(AppError::new(StatusCode::UNAUTHORIZED, code::DEVICE_REVOKED, "device removed"));
+                return Err(device_revoked());
             }
             let s = new_session(&tx, &account_id, &device_id)?;
             tx.commit()?;
@@ -565,11 +616,7 @@ pub async fn authenticate(st: &Shared, token: &str) -> AppResult<AuthUser> {
         })
         .await?;
     match row {
-        Some((_, _, _, Some(_), _)) => Err(AppError::new(
-            StatusCode::UNAUTHORIZED,
-            code::DEVICE_REVOKED,
-            "device removed",
-        )),
+        Some((_, _, _, Some(_), _)) => Err(device_revoked()),
         Some((account_id, device_id, exp, None, _)) if exp > now_ms() => Ok(AuthUser {
             account_id,
             device_id,

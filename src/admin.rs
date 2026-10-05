@@ -200,11 +200,12 @@ pub async fn revoke_device(
                     |r| r.get(0),
                 )
                 .optional()?;
+            // sessions are kept so the device's tokens answer `device_revoked` (see
+            // `account::revoke_device`)
             c.execute(
                 "UPDATE devices SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
                 params![device_id, now_ms()],
             )?;
-            c.execute("DELETE FROM sessions WHERE device_id = ?1", [&device_id])?;
             db::audit(c, acc.as_deref(), "device_revoke", "", "admin", &device_id)?;
             Ok(acc)
         })
@@ -296,7 +297,8 @@ pub async fn backup_status(State(st): State<Shared>, _a: Admin) -> AppResult<Jso
     let r = st
         .db
         .run(move |c| {
-            let settings = backup::load_settings(c, &st2)?;
+            let mut settings = backup::load_settings(c, &st2)?;
+            mask_secrets(&mut settings.notify);
             let mut targets = vec![];
             for t in backup::load_targets(c)? {
                 let state: Option<(Option<i64>, Option<i64>, String)> = c
@@ -323,10 +325,29 @@ pub async fn backup_status(State(st): State<Shared>, _a: Admin) -> AppResult<Jso
     Ok(Json(r))
 }
 
+/// Notification secrets are write-only: reads show [`adm::SECRET_MASK`] instead.
+fn mask_secrets(n: &mut adm::NotifyConfig) {
+    for v in [&mut n.smtp_password, &mut n.telegram_bot_token] {
+        if !v.is_empty() {
+            *v = adm::SECRET_MASK.into();
+        }
+    }
+}
+
+/// A secret sent back as the mask keeps its stored value.
+fn unmask_secrets(n: &mut adm::NotifyConfig, stored: &adm::NotifyConfig) {
+    if n.smtp_password == adm::SECRET_MASK {
+        n.smtp_password = stored.smtp_password.clone();
+    }
+    if n.telegram_bot_token == adm::SECRET_MASK {
+        n.telegram_bot_token = stored.telegram_bot_token.clone();
+    }
+}
+
 pub async fn put_settings(
     State(st): State<Shared>,
     _a: Admin,
-    Json(s): Json<adm::BackupSettings>,
+    Json(mut s): Json<adm::BackupSettings>,
 ) -> AppResult<Json<Value>> {
     for r in &s.recipients {
         if !npw_backup::valid_recipient(r) {
@@ -338,7 +359,11 @@ pub async fn put_settings(
     }
     let st2 = st.clone();
     st.db
-        .run(move |c| backup::save_settings(c, &st2, &s))
+        .run(move |c| {
+            let stored = backup::load_settings(c, &st2)?;
+            unmask_secrets(&mut s.notify, &stored.notify);
+            backup::save_settings(c, &st2, &s)
+        })
         .await?;
     Ok(Json(json!({})))
 }

@@ -96,6 +96,7 @@ pub async fn create_vault(
     for v in [&req.wrapped_key, &req.encrypted_meta] {
         unb64(v).ok_or_else(|| AppError::invalid("bad base64"))?;
     }
+    let account = user.account_id.clone();
     st.db
         .run(move |c| {
             let tx = c.transaction()?;
@@ -113,6 +114,8 @@ pub async fn create_vault(
             Ok(())
         })
         .await?;
+    // the account's other devices pick up the new vault
+    let _ = st.events.send((account, api::Event::AccountChanged));
     st.notify_change();
     Ok(ok())
 }
@@ -167,9 +170,15 @@ pub async fn password_finish(
     if !st.cfg.allow_weak_kdf {
         req.kdf.validate()?;
     }
+    // A bad salt or key would lock the account out for good: refuse before replacing anything.
+    crate::auth::check_salt(&req.account_salt)?;
+    if unb64(&req.encrypted_account_key).is_none_or(|k| k.is_empty()) {
+        return Err(AppError::invalid("bad encrypted account key"));
+    }
     let record = opaque::server_register_finish(
         &unb64(&req.opaque_upload).ok_or_else(|| AppError::invalid("bad base64"))?,
     )?;
+    let account = user.account_id.clone();
     st.db
         .run(move |c| {
             let tx = c.transaction()?;
@@ -184,6 +193,9 @@ pub async fn password_finish(
             Ok(())
         })
         .await?;
+    // other devices fetch the new wrapped account key (their sessions are gone, so
+    // only those still connected hear this; the rest pick it up when signed in again)
+    let _ = st.events.send((account, api::Event::AccountChanged));
     st.notify_change();
     Ok(ok())
 }
@@ -231,7 +243,10 @@ pub async fn revoke_device(
             if n == 0 {
                 return Err(AppError::not_found());
             }
-            tx.execute("DELETE FROM sessions WHERE device_id = ?1", [&device_id])?;
+            // The device's sessions are kept (they expire on their own): its tokens now
+            // answer `device_revoked`, which tells the device to wipe its local copy.
+            // Deleting them would answer `unauthorized`, which a client treats as an
+            // expired session and renews by signing in again.
             db::audit(&tx, Some(&user.account_id), "device_revoke", &user.device_id, &user.ip, &device_id)?;
             tx.commit()?;
             Ok(())

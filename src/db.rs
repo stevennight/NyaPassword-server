@@ -9,7 +9,8 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{AppError, AppResult};
 
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 
 CREATE TABLE accounts (
@@ -159,7 +160,29 @@ CREATE TABLE backup_target_state (
 CREATE TABLE backup_target_blobs (target_id TEXT NOT NULL, attachment_id TEXT NOT NULL, PRIMARY KEY (target_id, attachment_id));
 CREATE TABLE backup_runs (id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, data TEXT NOT NULL);
 CREATE TABLE drill_runs (id TEXT PRIMARY KEY, at INTEGER NOT NULL, data TEXT NOT NULL);
-"#];
+"#,
+    r#"
+-- Idempotency records are scoped to the vault and the writing account: an op_id
+-- used elsewhere must never make a write look already done.
+CREATE TABLE ops_scoped (
+    vault_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    op_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (vault_id, account_id, op_id)
+);
+INSERT INTO ops_scoped (vault_id, account_id, op_id, item_id, revision, seq, created_at)
+    SELECT o.vault_id,
+           COALESCE((SELECT m.account_id FROM vault_members m WHERE m.vault_id = o.vault_id AND m.role = 'owner' LIMIT 1), ''),
+           o.op_id, o.item_id, o.revision, o.seq, o.created_at
+    FROM ops o;
+DROP TABLE ops;
+ALTER TABLE ops_scoped RENAME TO ops;
+"#,
+];
 
 #[derive(Clone)]
 pub struct Db {
@@ -252,4 +275,43 @@ pub fn audit(
         rusqlite::params![account_id, now_ms(), action, device_id, ip, detail],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ops_migration_keeps_records_and_scopes_them_to_the_owner() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATIONS[0]).unwrap();
+        c.pragma_update(None, "user_version", 1).unwrap();
+        c.execute_batch(
+            "INSERT INTO accounts (id, login, opaque_record, kdf, account_salt, encrypted_account_key, public_key, encrypted_private_key, created_at, updated_at)
+               VALUES ('acc', 'me@example.com', x'00', '{}', 's', 'k', 'p', 'e', 0, 0);
+             INSERT INTO vaults (id, encrypted_meta, created_by, created_at) VALUES ('v', 'm', 'acc', 0);
+             INSERT INTO vault_members (vault_id, account_id, role, wrapped_key, created_at) VALUES ('v', 'acc', 'owner', 'w', 0);
+             INSERT INTO ops (op_id, vault_id, item_id, revision, seq, created_at) VALUES ('op', 'v', 'i', 3, 7, 0);",
+        )
+        .unwrap();
+        migrate(&mut c).unwrap();
+        let row: (String, String, String, i64, i64) = c
+            .query_row(
+                "SELECT vault_id, account_id, item_id, revision, seq FROM ops WHERE op_id = 'op'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("v".into(), "acc".into(), "i".into(), 3, 7));
+        // the same op id may now exist in another vault or for another account
+        c.execute(
+            "INSERT INTO ops (vault_id, account_id, op_id, item_id, revision, seq, created_at) VALUES ('v2', 'acc', 'op', 'j', 1, 1, 0)",
+            [],
+        )
+        .unwrap();
+        let v: i64 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len());
+    }
 }

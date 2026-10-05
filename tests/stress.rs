@@ -2,8 +2,10 @@
 //! devices edit, delete and restore the same items with random sync timing,
 //! some syncs cancelled half-way (as if the app was killed), and the clients
 //! sometimes restarted from their stores. Afterwards:
-//! - every value a device had saved when it started a sync can be found in
-//!   the server's revision history (in place or as a recorded conflict);
+//! - every value a device had saved when it started a sync that then completed
+//!   can be found in the server's revision history (in place or as a recorded
+//!   conflict). A value held only during a cancelled sync may be overwritten
+//!   locally before it ever reaches the server, which is not a loss;
 //! - all devices and the server agree (same digest, same item content).
 //!
 //! `NPW_STRESS_OPS` sets the number of operations (default 600).
@@ -42,6 +44,28 @@ fn tokens_of(c: &ItemContent) -> HashSet<String> {
     let mut s = HashSet::new();
     all_strings(&serde_json::to_value(c).unwrap(), &mut s);
     s.into_iter().filter(|t| t.starts_with("tok-")).collect()
+}
+
+/// Every token in a device's items (also those in the trash).
+fn device_tokens(c: &Client, vault: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for v in c
+        .list_items(&ItemFilter::default())
+        .unwrap()
+        .into_iter()
+        .chain(
+            c.list_items(&ItemFilter {
+                trash: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+    {
+        out.extend(tokens_of(
+            &c.item(vault, &v.item_id).unwrap().content.unwrap(),
+        ));
+    }
+    out
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -87,7 +111,7 @@ async fn random_concurrent_edits_lose_nothing() {
         counter += 1;
         format!("tok-{counter}")
     };
-    // tokens each device had saved when a sync began: they must survive
+    // tokens a device held when a sync began that then completed: they must survive
     let mut committed: HashSet<String> = HashSet::new();
     let mut cancelled = 0;
     let mut restarts = 0;
@@ -147,42 +171,31 @@ async fn random_concurrent_edits_lose_nothing() {
                 restarts += 1;
             }
             _ => {
-                for v in dev
-                    .client
-                    .list_items(&ItemFilter::default())
-                    .unwrap()
-                    .into_iter()
-                    .chain(
-                        dev.client
-                            .list_items(&ItemFilter {
-                                trash: true,
-                                ..Default::default()
-                            })
-                            .unwrap(),
-                    )
-                {
-                    committed.extend(tokens_of(
-                        &dev.client
-                            .item(&vault, &v.item_id)
-                            .unwrap()
-                            .content
-                            .unwrap(),
-                    ));
-                }
+                // values held when the sync starts count as committed only if that
+                // sync completes: after a cancelled one, a later local edit may
+                // overwrite a value that never reached the server (not a loss)
+                let held = device_tokens(&dev.client, &vault);
                 if rng.gen_bool(0.15) {
                     // cancel the sync part-way, as if the process died mid-request
                     let ms = rng.gen_range(0..20);
-                    if tokio::time::timeout(std::time::Duration::from_millis(ms), dev.client.sync())
-                        .await
-                        .is_err()
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(ms),
+                        dev.client.sync(),
+                    )
+                    .await
                     {
-                        cancelled += 1;
+                        Err(_) => cancelled += 1,
+                        Ok(r) => {
+                            r.unwrap_or_else(|e| panic!("step {step}: sync failed: {e}"));
+                            committed.extend(held);
+                        }
                     }
                 } else {
                     dev.client
                         .sync()
                         .await
                         .unwrap_or_else(|e| panic!("step {step}: sync failed: {e}"));
+                    committed.extend(held);
                 }
             }
         }
@@ -191,29 +204,9 @@ async fn random_concurrent_edits_lose_nothing() {
     // settle: everyone syncs until nothing changes
     for _ in 0..3 {
         for dev in &devices {
-            for v in dev
-                .client
-                .list_items(&ItemFilter::default())
-                .unwrap()
-                .into_iter()
-                .chain(
-                    dev.client
-                        .list_items(&ItemFilter {
-                            trash: true,
-                            ..Default::default()
-                        })
-                        .unwrap(),
-                )
-            {
-                committed.extend(tokens_of(
-                    &dev.client
-                        .item(&vault, &v.item_id)
-                        .unwrap()
-                        .content
-                        .unwrap(),
-                ));
-            }
+            let held = device_tokens(&dev.client, &vault);
             dev.client.sync().await.unwrap();
+            committed.extend(held);
         }
     }
 
