@@ -76,6 +76,80 @@ async fn register_sign_in_and_sync_between_devices() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reprompt_flag_syncs_and_the_user_can_be_verified() {
+    let srv = TestServer::start().await;
+    let a = client("A");
+    let kit = a
+        .register(&srv.url, "me@example.com", "correct horse", None)
+        .await
+        .unwrap();
+    let vault = a.vaults().unwrap()[0].id.clone();
+    let mut item = login_item("Bank", "me", "p0");
+    item.reprompt = true;
+    let id = a.save_item(&vault, None, item).unwrap();
+    a.save_item(&vault, None, login_item("Plain", "me", "p1"))
+        .unwrap();
+
+    // every view tells the host, without loading the item
+    let list = a.list_items(&ItemFilter::default()).unwrap();
+    let flags: Vec<(String, bool)> = list.iter().map(|v| (v.title.clone(), v.reprompt)).collect();
+    assert!(flags.contains(&("Bank".into(), true)));
+    assert!(flags.contains(&("Plain".into(), false)));
+    // (both items match: same registrable domain)
+    let cands = a
+        .autofill_candidates("https://bank.example.com/login")
+        .unwrap();
+    assert_eq!(cands.len(), 2);
+    for c in &cands {
+        assert_eq!(c.reprompt, c.item_id == id, "{}", c.title);
+    }
+
+    // passkey candidates carry it too
+    let caller = npw_core::passkeys::PasskeyCaller::Web {
+        origin: "https://bank.example.com".into(),
+    };
+    let create = r#"{"rp":{"id":"bank.example.com","name":"Bank"},"user":{"id":"dXNlcjE","name":"me","displayName":"Me"},
+        "challenge":"Y2hhbGxlbmdl","pubKeyCredParams":[{"type":"public-key","alg":-7}]}"#;
+    a.passkey_create(&caller, create, Some((&vault, &id)), &vault)
+        .unwrap();
+    let get = r#"{"challenge":"Y2hhbGxlbmdlMg","rpId":"bank.example.com"}"#;
+    let pks = a.passkey_candidates(&caller, get).unwrap();
+    assert_eq!(pks.len(), 1);
+    assert!(pks[0].reprompt);
+
+    // the flag syncs (it is item content, opaque to the server)
+    a.sync().await.unwrap();
+    let b = client("B");
+    b.sign_in(&srv.url, "me@example.com", "correct horse", &kit.secret_key)
+        .await
+        .unwrap();
+    b.sync().await.unwrap();
+    let got = b.item(&vault, &id).unwrap();
+    assert!(got.reprompt);
+    assert!(got.content.unwrap().reprompt);
+
+    // verification does not change the lock state
+    assert!(matches!(
+        a.verify_password("nope"),
+        Err(CoreError::WrongPassword)
+    ));
+    a.verify_password("correct horse").unwrap();
+    assert!(a.is_unlocked());
+    let k = a.quick_unlock_key().unwrap();
+    a.verify_key(&k).unwrap();
+    assert!(matches!(
+        a.verify_key(&[1u8; 32]),
+        Err(CoreError::WrongPassword)
+    ));
+    assert!(a.verify_key(&[1u8; 3]).is_err());
+    assert!(a.is_unlocked());
+    a.lock();
+    assert!(matches!(a.verify_key(&k), Err(CoreError::Locked)));
+    assert!(!a.is_unlocked());
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_edits_keep_every_value() {
     let srv = TestServer::start().await;
     let a = client("A");
