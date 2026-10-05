@@ -27,6 +27,8 @@ services:
       - SETUID
       - SETGID
       - DAC_OVERRIDE
+      # entrypoint.sh chmods /data after handing it to the nyapassword user
+      - FOWNER
     logging:
       driver: json-file
       options:
