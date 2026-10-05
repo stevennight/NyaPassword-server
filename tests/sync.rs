@@ -150,6 +150,50 @@ async fn reprompt_flag_syncs_and_the_user_can_be_verified() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pin_unlock_and_verification() {
+    let srv = TestServer::start().await;
+    let a = client("A");
+    a.register(&srv.url, "me@example.com", "correct horse", None)
+        .await
+        .unwrap();
+    let vault = a.vaults().unwrap()[0].id.clone();
+    a.save_item(&vault, None, login_item("Site", "me", "p0"))
+        .unwrap();
+
+    assert!(matches!(a.pin_wrap("12"), Err(CoreError::Invalid(_))));
+    let blob = a.pin_wrap("2580").unwrap();
+    // the PIN key uses the account's KDF parameters
+    assert_eq!(blob.account_id, a.lock_state().account_id);
+
+    // verification does not change the lock state
+    a.verify_pin(&blob, "2580").unwrap();
+    assert!(matches!(
+        a.verify_pin(&blob, "0000"),
+        Err(CoreError::WrongPassword)
+    ));
+    assert!(a.is_unlocked());
+
+    // unlock offline with the PIN
+    a.lock();
+    assert!(matches!(
+        a.unlock_with_pin(&blob, "1111"),
+        Err(CoreError::WrongPassword)
+    ));
+    assert!(!a.is_unlocked());
+    a.unlock_with_pin(&blob, "2580").unwrap();
+    assert_eq!(a.list_items(&ItemFilter::default()).unwrap().len(), 1);
+
+    // a password change keeps AK, so the core would still open the blob: the
+    // hosts delete their PIN and biometric material themselves (加密规格.md §4.4)
+    a.change_password("correct horse", "battery staple")
+        .await
+        .unwrap();
+    a.lock();
+    a.unlock_with_pin(&blob, "2580").unwrap();
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_edits_keep_every_value() {
     let srv = TestServer::start().await;
     let a = client("A");
