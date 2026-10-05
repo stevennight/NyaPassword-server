@@ -1,10 +1,48 @@
 //! Backup alerts: generic webhook, Telegram, Bark, e-mail.
 
-use npw_api::admin::NotifyConfig;
+use npw_api::admin::{channel, NotifyConfig};
 use serde_json::json;
 
-/// Sends to every configured channel. Returns the channels that failed.
+/// Whether `channel` has the settings it needs.
+pub fn configured(cfg: &NotifyConfig, channel: &str) -> bool {
+    match channel {
+        channel::WEBHOOK => !cfg.webhook_url.is_empty(),
+        channel::TELEGRAM => !cfg.telegram_bot_token.is_empty() && !cfg.telegram_chat_id.is_empty(),
+        channel::BARK => !cfg.bark_url.is_empty(),
+        channel::EMAIL => !cfg.smtp_host.is_empty() && !cfg.smtp_to.is_empty(),
+        _ => false,
+    }
+}
+
+/// Configured channels that are not switched off.
+pub fn active(cfg: &NotifyConfig) -> Vec<&'static str> {
+    channel::ALL
+        .into_iter()
+        .filter(|c| configured(cfg, c) && !cfg.off.iter().any(|o| o == c))
+        .collect()
+}
+
+/// Sends an alert `event` ([`npw_api::admin::alert`]) to every active
+/// channel, unless the event is muted. Returns the channels that failed.
+pub async fn send_event(cfg: &NotifyConfig, event: &str, title: &str, body: &str) -> Vec<String> {
+    if cfg.muted_events.iter().any(|e| e == event) {
+        return vec![];
+    }
+    send_to(cfg, &active(cfg), title, body).await
+}
+
+/// Sends to every active channel. Returns the channels that failed.
 pub async fn send(cfg: &NotifyConfig, title: &str, body: &str) -> Vec<String> {
+    send_to(cfg, &active(cfg), title, body).await
+}
+
+/// Sends to the given channels (whether switched off or not). Returns the channels that failed.
+pub async fn send_to(
+    cfg: &NotifyConfig,
+    channels: &[&str],
+    title: &str,
+    body: &str,
+) -> Vec<String> {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -13,45 +51,57 @@ pub async fn send(cfg: &NotifyConfig, title: &str, body: &str) -> Vec<String> {
         Err(e) => return vec![format!("http client: {e}")],
     };
     let mut failed = vec![];
-    if !cfg.webhook_url.is_empty() {
-        let r = client
-            .post(&cfg.webhook_url)
-            .json(&json!({ "title": title, "message": body, "source": "nyapassword" }))
-            .send()
-            .await;
-        if !matches!(&r, Ok(resp) if resp.status().is_success()) {
-            failed.push(format!("webhook: {}", describe(r)));
+    for ch in channels {
+        if !configured(cfg, ch) {
+            failed.push(format!("{ch}: not configured"));
+            continue;
         }
-    }
-    if !cfg.telegram_bot_token.is_empty() && !cfg.telegram_chat_id.is_empty() {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            cfg.telegram_bot_token
-        );
-        let r = client
-            .post(url)
-            .json(&json!({ "chat_id": cfg.telegram_chat_id, "text": format!("{title}\n{body}") }))
-            .send()
-            .await;
-        if !matches!(&r, Ok(resp) if resp.status().is_success()) {
-            failed.push(format!("telegram: {}", describe(r)));
-        }
-    }
-    if !cfg.bark_url.is_empty() {
-        let url = format!(
-            "{}/{}/{}",
-            cfg.bark_url.trim_end_matches('/'),
-            enc(title),
-            enc(body)
-        );
-        let r = client.get(url).send().await;
-        if !matches!(&r, Ok(resp) if resp.status().is_success()) {
-            failed.push(format!("bark: {}", describe(r)));
-        }
-    }
-    if !cfg.smtp_host.is_empty() && !cfg.smtp_to.is_empty() {
-        if let Err(e) = send_mail(cfg, title, body).await {
-            failed.push(format!("email: {e}"));
+        match *ch {
+            channel::WEBHOOK => {
+                let r = client
+                    .post(&cfg.webhook_url)
+                    .json(&json!({ "title": title, "message": body, "source": "nyapassword" }))
+                    .send()
+                    .await;
+                if !matches!(&r, Ok(resp) if resp.status().is_success()) {
+                    failed.push(format!("webhook: {}", describe(r)));
+                }
+            }
+            channel::TELEGRAM => {
+                let url = format!(
+                    "https://api.telegram.org/bot{}/sendMessage",
+                    cfg.telegram_bot_token
+                );
+                let r = client
+                    .post(url)
+                    .json(
+                        &json!({ "chat_id": cfg.telegram_chat_id, "text": format!("{title}
+{body}") }),
+                    )
+                    .send()
+                    .await;
+                if !matches!(&r, Ok(resp) if resp.status().is_success()) {
+                    failed.push(format!("telegram: {}", describe(r)));
+                }
+            }
+            channel::BARK => {
+                let url = format!(
+                    "{}/{}/{}",
+                    cfg.bark_url.trim_end_matches('/'),
+                    enc(title),
+                    enc(body)
+                );
+                let r = client.get(url).send().await;
+                if !matches!(&r, Ok(resp) if resp.status().is_success()) {
+                    failed.push(format!("bark: {}", describe(r)));
+                }
+            }
+            channel::EMAIL => {
+                if let Err(e) = send_mail(cfg, title, body).await {
+                    failed.push(format!("email: {e}"));
+                }
+            }
+            other => failed.push(format!("{other}: unknown channel")),
         }
     }
     for f in &failed {

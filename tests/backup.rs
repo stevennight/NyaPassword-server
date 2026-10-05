@@ -217,3 +217,101 @@ async fn retention_prunes_and_drill_detects_damage() {
     assert!(!drill.ok);
     srv.stop().await;
 }
+
+/// A recovery key made by the admin console in the browser
+/// (`common/web/src/apps/admin/agekey.ts`; the pair and its downloadable key
+/// file are in agekey.vectors.json): register its public key the way the
+/// console does, back up, then restore with `nyapassword-server restore
+/// --identity <the downloaded key file>` and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_generated_recovery_key_restores_a_backup() {
+    let v: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../common/web/src/apps/admin/agekey.vectors.json"
+    )))
+    .unwrap();
+    let recipient = v["generated"]["recipient"].as_str().unwrap().to_string();
+    let key_file = v["generated"]["key_file"].as_str().unwrap();
+    assert_eq!(
+        npw_backup::recipient_of(v["generated"]["identity"].as_str().unwrap()).unwrap(),
+        recipient
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let target_dir = tmp.path().join("target");
+    let srv = TestServer::start_in(data.clone(), None).await;
+    let st = srv.state.clone();
+    let r = recipient.clone();
+    let td = target_dir.clone();
+    srv.state
+        .db
+        .run_sync(move |c| {
+            let mut s = backup::load_settings(c, &st)?;
+            s.recipients = vec![r.clone()];
+            s.recipient_info = vec![npw_api::admin::RecipientInfo {
+                recipient: r,
+                label: "测试恢复密钥".into(),
+                created_at: 1,
+            }];
+            backup::save_settings(c, &st, &s)?;
+            backup::save_target(c, &fs_target(&td))
+        })
+        .unwrap();
+    let a = client("A");
+    a.register(&srv.url, "me@example.com", "pw", None)
+        .await
+        .unwrap();
+    let vault = a.vaults().unwrap()[0].id.clone();
+    for i in 0..3 {
+        a.save_item(&vault, None, login_item(&format!("K{i}"), "u", "p"))
+            .unwrap();
+    }
+    a.sync().await.unwrap();
+    let run = backup::run_backup(&srv.state, "manual").await.unwrap();
+    assert!(run.results.iter().all(|r| r.ok), "{:?}", run.results);
+    srv.stop().await;
+
+    // the downloaded file as is: comment lines with the instructions, then the key
+    let id_file = tmp.path().join("nyapassword-recovery-key.txt");
+    std::fs::write(&id_file, key_file).unwrap();
+    let restored = tmp.path().join("restored");
+    let args = |dry_run: bool| nyapassword_server::restore::RestoreArgs {
+        file: None,
+        identity: id_file.clone(),
+        to: Some(restored.clone()),
+        replace: false,
+        dry_run,
+        object: None,
+        kind: Some("fs".into()),
+        endpoint: Some(target_dir.to_string_lossy().to_string()),
+        bucket: None,
+        root: "npw".into(),
+        username: String::new(),
+        secret: String::new(),
+    };
+    nyapassword_server::restore::run(args(true), restored.clone())
+        .await
+        .unwrap();
+    assert!(
+        !restored.join("nyapassword.sqlite3").exists(),
+        "dry run writes nothing"
+    );
+    nyapassword_server::restore::run(args(false), restored.clone())
+        .await
+        .unwrap();
+    let c = rusqlite::Connection::open(restored.join("nyapassword.sqlite3")).unwrap();
+    let items: i64 = c
+        .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(items, 3);
+
+    // a different key cannot open it
+    let (other, _) = npw_backup::generate_identity();
+    std::fs::write(&id_file, other).unwrap();
+    assert!(
+        nyapassword_server::restore::run(args(true), restored.clone())
+            .await
+            .is_err()
+    );
+}

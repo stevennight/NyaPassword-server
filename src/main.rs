@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
                 st.db
                     .run_sync(|c| Ok(db::set_setting(c, admin::TOTP_KEY, &secret)?))
                     .map_err(|e| anyhow::anyhow!(e.message))?;
-                println!("otpauth://totp/NyaPassword:admin?secret={secret}&issuer=NyaPassword");
+                println!("{}", admin::totp_uri(&secret));
             }
             Ok(())
         }
@@ -152,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::AgeKeygen => {
             let (secret, public) = npw_backup::generate_identity();
-            println!("# public key (add it to the backup recipients): {public}");
+            println!("# public key (register it in the admin console: 恢复密钥, paste an existing public key): {public}");
             println!("{secret}");
             Ok(())
         }

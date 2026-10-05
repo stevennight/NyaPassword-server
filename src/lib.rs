@@ -144,7 +144,21 @@ pub fn router(st: Shared) -> Router {
             "/v1/admin/backup/manual-drill",
             post(admin::manual_drill_done),
         )
-        .route("/v1/admin/notify/test", post(admin::test_notify));
+        .route("/v1/admin/notify/test", post(admin::test_notify))
+        .route(
+            "/v1/admin/backup/test-target",
+            post(admin::test_unsaved_target),
+        )
+        .route("/v1/admin/backup/recipients", post(admin::add_recipient))
+        .route(
+            "/v1/admin/backup/recipients/{recipient}",
+            delete(admin::remove_recipient),
+        )
+        .route("/v1/admin/security", get(admin::security))
+        .route("/v1/admin/password", post(admin::change_password))
+        .route("/v1/admin/totp/setup", post(admin::totp_setup))
+        .route("/v1/admin/totp/enable", post(admin::totp_enable))
+        .route("/v1/admin/totp/disable", post(admin::totp_disable));
     api.fallback(web::static_handler).with_state(st)
 }
 

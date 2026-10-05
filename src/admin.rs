@@ -1,5 +1,6 @@
 //! The admin API behind the management console: health, accounts and devices,
-//! invites, audit log, backup targets / settings / runs / drills.
+//! invites, audit log, backup targets / settings / recovery keys / runs /
+//! checks, alert channels, and the admin's own password and TOTP.
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -34,7 +35,32 @@ pub fn set_password(c: &Connection, pw: &str) -> rusqlite::Result<()> {
     db::set_setting(c, PASSWORD_KEY, &hash_password(pw))
 }
 
-pub struct Admin;
+fn password_matches(hash: &str, password: &str) -> AppResult<bool> {
+    let parsed = PasswordHash::new(hash).map_err(AppError::internal)?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
+}
+
+/// Accepts the code of the previous, current and next 30-second step.
+fn totp_matches(secret: &str, code: &str) -> AppResult<bool> {
+    let spec = npw_otp::OtpSpec::parse(secret).map_err(AppError::internal)?;
+    let now = (now_ms() / 1000) as u64;
+    let code = code.replace(' ', "");
+    Ok(!code.is_empty()
+        && [now.saturating_sub(30), now, now + 30]
+            .iter()
+            .any(|t| spec.code(*t) == code))
+}
+
+pub fn totp_uri(secret: &str) -> String {
+    format!("otpauth://totp/NyaPassword:admin?secret={secret}&issuer=NyaPassword")
+}
+
+/// An authenticated admin request; holds the session's token hash.
+pub struct Admin {
+    token_hash: String,
+}
 
 impl FromRequestParts<Shared> for Admin {
     type Rejection = AppError;
@@ -50,7 +76,7 @@ impl FromRequestParts<Shared> for Admin {
         let now = now_ms();
         s.retain(|_, exp| *exp > now);
         if s.contains_key(&h) {
-            Ok(Admin)
+            Ok(Admin { token_hash: h })
         } else {
             Err(AppError::unauthorized())
         }
@@ -83,20 +109,10 @@ pub async fn login(
             "admin password not set: run `nyapassword-server admin-password`",
         ));
     };
-    let parsed = PasswordHash::new(&hash).map_err(AppError::internal)?;
-    let pw_ok = Argon2::default()
-        .verify_password(req.password.as_bytes(), &parsed)
-        .is_ok();
+    let pw_ok = password_matches(&hash, &req.password)?;
     let totp_ok = match totp {
         None => true,
-        Some(secret) => {
-            let spec = npw_otp::OtpSpec::parse(&secret).map_err(AppError::internal)?;
-            let now = (now_ms() / 1000) as u64;
-            let code = req.totp.unwrap_or_default().replace(' ', "");
-            [now.saturating_sub(30), now, now + 30]
-                .iter()
-                .any(|t| spec.code(*t) == code)
-        }
+        Some(secret) => totp_matches(&secret, req.totp.as_deref().unwrap_or_default())?,
     };
     let ip2 = ip.clone();
     if !(pw_ok && totp_ok) {
@@ -299,6 +315,7 @@ pub async fn backup_status(State(st): State<Shared>, _a: Admin) -> AppResult<Jso
         .run(move |c| {
             let mut settings = backup::load_settings(c, &st2)?;
             mask_secrets(&mut settings.notify);
+            fill_recipient_info(&mut settings, None);
             let mut targets = vec![];
             for t in backup::load_targets(c)? {
                 let state: Option<(Option<i64>, Option<i64>, String)> = c
@@ -344,37 +361,167 @@ fn unmask_secrets(n: &mut adm::NotifyConfig, stored: &adm::NotifyConfig) {
     }
 }
 
+/// Makes `recipient_info` hold exactly one entry per recipient, in the same
+/// order. Labels come from the request when it brings one, else from `known`
+/// (the stored settings); times come from `known`, and recipients new to it
+/// get the current time.
+fn fill_recipient_info(s: &mut adm::BackupSettings, known: Option<&adm::BackupSettings>) {
+    let now = now_ms();
+    let find =
+        |list: &[adm::RecipientInfo], r: &str| list.iter().find(|i| i.recipient == r).cloned();
+    s.recipient_info = s
+        .recipients
+        .iter()
+        .map(|r| {
+            let given = find(&s.recipient_info, r);
+            let stored = known.and_then(|k| find(&k.recipient_info, r));
+            let label = given
+                .as_ref()
+                .map(|g| g.label.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .or_else(|| stored.as_ref().map(|i| i.label.clone()))
+                .unwrap_or_default();
+            let created_at = match known {
+                // reading: what is stored (0 for keys added before labels existed)
+                None => given.map_or(0, |g| g.created_at),
+                Some(k) => match stored {
+                    Some(i) => i.created_at,
+                    None if k.recipients.contains(r) => 0,
+                    None => now,
+                },
+            };
+            adm::RecipientInfo {
+                recipient: r.clone(),
+                label,
+                created_at,
+            }
+        })
+        .collect();
+}
+
+fn check_recipient(r: &str) -> AppResult<()> {
+    if npw_backup::valid_recipient(r) {
+        Ok(())
+    } else {
+        Err(AppError::invalid(format!("not an age recipient: {r}")))
+    }
+}
+
+/// Saves the settings and audits changes to the recipient list.
+fn store_settings(
+    c: &Connection,
+    st: &Shared,
+    mut s: adm::BackupSettings,
+    stored: &adm::BackupSettings,
+) -> AppResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    s.recipients = s
+        .recipients
+        .iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| seen.insert(r.clone()))
+        .collect();
+    fill_recipient_info(&mut s, Some(stored));
+    backup::save_settings(c, st, &s)?;
+    for r in s
+        .recipients
+        .iter()
+        .filter(|r| !stored.recipients.contains(r))
+    {
+        db::audit(c, None, "admin_recipient_add", "", "admin", r)?;
+    }
+    for r in stored
+        .recipients
+        .iter()
+        .filter(|r| !s.recipients.contains(r))
+    {
+        db::audit(c, None, "admin_recipient_remove", "", "admin", r)?;
+    }
+    Ok(())
+}
+
 pub async fn put_settings(
     State(st): State<Shared>,
     _a: Admin,
     Json(mut s): Json<adm::BackupSettings>,
 ) -> AppResult<Json<Value>> {
     for r in &s.recipients {
-        if !npw_backup::valid_recipient(r) {
-            return Err(AppError::invalid(format!("not an age recipient: {r}")));
-        }
+        check_recipient(r.trim())?;
     }
     if s.daily_hour_utc > 23 || s.debounce_minutes > 24 * 60 {
         return Err(AppError::invalid("bad schedule"));
+    }
+    for v in s.notify.off.iter().chain(&s.notify.muted_events) {
+        if !adm::channel::ALL.contains(&v.as_str()) && !adm::alert::ALL.contains(&v.as_str()) {
+            return Err(AppError::invalid(format!("unknown channel or event {v}")));
+        }
     }
     let st2 = st.clone();
     st.db
         .run(move |c| {
             let stored = backup::load_settings(c, &st2)?;
             unmask_secrets(&mut s.notify, &stored.notify);
-            backup::save_settings(c, &st2, &s)
+            store_settings(c, &st2, s, &stored)
         })
         .await?;
     Ok(Json(json!({})))
 }
 
-pub async fn put_target(
+/// Registers one more offline recovery key (an age recipient) with a label.
+pub async fn add_recipient(
     State(st): State<Shared>,
     _a: Admin,
-    Path(id): Path<String>,
-    Json(mut t): Json<adm::BackupTarget>,
-) -> AppResult<Json<adm::BackupTarget>> {
-    t.id = id;
+    Json(req): Json<adm::RecipientReq>,
+) -> AppResult<Json<Vec<adm::RecipientInfo>>> {
+    let r = req.recipient.trim().to_string();
+    check_recipient(&r)?;
+    if r == st.keys.age_recipient() {
+        return Err(AppError::invalid(
+            "this is the server's own key, which is always a recipient",
+        ));
+    }
+    let st2 = st.clone();
+    let out = st
+        .db
+        .run(move |c| {
+            let stored = backup::load_settings(c, &st2)?;
+            let mut s = stored.clone();
+            if !s.recipients.contains(&r) {
+                s.recipients.push(r.clone());
+            }
+            s.recipient_info.retain(|i| i.recipient != r);
+            s.recipient_info.push(adm::RecipientInfo {
+                recipient: r,
+                label: req.label,
+                created_at: 0,
+            });
+            store_settings(c, &st2, s, &stored)?;
+            Ok(backup::load_settings(c, &st2)?.recipient_info)
+        })
+        .await?;
+    Ok(Json(out))
+}
+
+pub async fn remove_recipient(
+    State(st): State<Shared>,
+    _a: Admin,
+    Path(recipient): Path<String>,
+) -> AppResult<Json<Vec<adm::RecipientInfo>>> {
+    let st2 = st.clone();
+    let out = st
+        .db
+        .run(move |c| {
+            let stored = backup::load_settings(c, &st2)?;
+            let mut s = stored.clone();
+            s.recipients.retain(|r| r != &recipient);
+            store_settings(c, &st2, s, &stored)?;
+            Ok(backup::load_settings(c, &st2)?.recipient_info)
+        })
+        .await?;
+    Ok(Json(out))
+}
+
+fn check_target(t: &adm::BackupTarget) -> AppResult<()> {
     if t.name.trim().is_empty() || t.endpoint.trim().is_empty() {
         return Err(AppError::invalid("name and endpoint are required"));
     }
@@ -391,23 +538,40 @@ pub async fn put_target(
     } else if !is_url {
         return Err(AppError::invalid("endpoint must be an http(s) URL"));
     }
+    Ok(())
+}
+
+/// The target to store or test: a new secret is sealed, an empty one keeps
+/// the stored secret of the target with the same id.
+fn seal_target(c: &Connection, st: &Shared, mut t: adm::BackupTarget) -> AppResult<StoredTarget> {
+    let existing = backup::load_targets(c)?
+        .into_iter()
+        .find(|x| x.target.id == t.id);
+    let sealed = if !t.secret.is_empty() {
+        st.keys.seal(&format!("target:{}", t.id), &t.secret)
+    } else {
+        existing.map(|e| e.secret_sealed).unwrap_or_default()
+    };
+    t.secret.clear();
+    Ok(StoredTarget {
+        target: t,
+        secret_sealed: sealed,
+    })
+}
+
+pub async fn put_target(
+    State(st): State<Shared>,
+    _a: Admin,
+    Path(id): Path<String>,
+    Json(mut t): Json<adm::BackupTarget>,
+) -> AppResult<Json<adm::BackupTarget>> {
+    t.id = id;
+    check_target(&t)?;
     let st2 = st.clone();
     let r = st
         .db
         .run(move |c| {
-            let existing = backup::load_targets(c)?
-                .into_iter()
-                .find(|x| x.target.id == t.id);
-            let sealed = if !t.secret.is_empty() {
-                st2.keys.seal(&format!("target:{}", t.id), &t.secret)
-            } else {
-                existing.map(|e| e.secret_sealed).unwrap_or_default()
-            };
-            t.secret.clear();
-            let stored = StoredTarget {
-                target: t,
-                secret_sealed: sealed,
-            };
+            let stored = seal_target(c, &st2, t)?;
             backup::save_target(c, &stored)?;
             Ok(stored.public())
         })
@@ -438,6 +602,23 @@ pub async fn delete_target(
 }
 
 /// Writes, reads and deletes a small probe object; in protect mode the delete is expected to fail.
+async fn probe(st: &Shared, t: &StoredTarget) -> AppResult<Value> {
+    let op = t
+        .operator(&st.keys)
+        .map_err(|e| AppError::invalid(format!("{e:#}")))?;
+    let probe = format!("probe/nyapassword-probe-{}.txt", now_ms());
+    let mut steps = vec![];
+    let write = crate::backup::targets::write(&op, &probe, b"nyapassword probe".to_vec()).await;
+    steps.push(json!({ "step": "write", "ok": write.is_ok(), "error": write.as_ref().err().map(|e| format!("{e:#}")) }));
+    if write.is_ok() {
+        let read = crate::backup::targets::read(&op, &probe).await;
+        steps.push(json!({ "step": "read", "ok": read.as_ref().is_ok_and(|d| d == b"nyapassword probe"), "error": read.as_ref().err().map(|e| format!("{e:#}")) }));
+        let del = crate::backup::targets::delete(&op, &probe).await;
+        steps.push(json!({ "step": "delete", "ok": del.is_ok(), "expected_to_fail": t.target.protect_mode, "error": del.as_ref().err().map(|e| format!("{e:#}")) }));
+    }
+    Ok(json!({ "steps": steps }))
+}
+
 pub async fn test_target(
     State(st): State<Shared>,
     _a: Admin,
@@ -452,20 +633,20 @@ pub async fn test_target(
                 .ok_or_else(AppError::not_found)
         })
         .await?;
-    let op = t
-        .operator(&st.keys)
-        .map_err(|e| AppError::invalid(format!("{e:#}")))?;
-    let probe = format!("probe/nyapassword-probe-{}.txt", now_ms());
-    let mut steps = vec![];
-    let write = crate::backup::targets::write(&op, &probe, b"nyapassword probe".to_vec()).await;
-    steps.push(json!({ "step": "write", "ok": write.is_ok(), "error": write.as_ref().err().map(|e| format!("{e:#}")) }));
-    if write.is_ok() {
-        let read = crate::backup::targets::read(&op, &probe).await;
-        steps.push(json!({ "step": "read", "ok": read.as_ref().is_ok_and(|d| d == b"nyapassword probe"), "error": read.as_ref().err().map(|e| format!("{e:#}")) }));
-        let del = crate::backup::targets::delete(&op, &probe).await;
-        steps.push(json!({ "step": "delete", "ok": del.is_ok(), "expected_to_fail": t.target.protect_mode, "error": del.as_ref().err().map(|e| format!("{e:#}")) }));
-    }
-    Ok(Json(json!({ "steps": steps })))
+    Ok(Json(probe(&st, &t).await?))
+}
+
+/// Tests a target before it is saved (the "添加目标" wizard). An empty
+/// `secret` uses the stored secret of the target with the same id.
+pub async fn test_unsaved_target(
+    State(st): State<Shared>,
+    _a: Admin,
+    Json(t): Json<adm::BackupTarget>,
+) -> AppResult<Json<Value>> {
+    check_target(&t)?;
+    let st2 = st.clone();
+    let stored = st.db.run(move |c| seal_target(c, &st2, t)).await?;
+    Ok(Json(probe(&st, &stored).await?))
 }
 
 pub async fn target_objects(
@@ -515,14 +696,154 @@ pub async fn manual_drill_done(State(st): State<Shared>, _a: Admin) -> AppResult
     Ok(Json(json!({})))
 }
 
-pub async fn test_notify(State(st): State<Shared>, _a: Admin) -> AppResult<Json<Value>> {
+/// Sends a test notification. The optional body ([`adm::NotifyTestReq`])
+/// picks one channel and/or brings unsaved settings.
+pub async fn test_notify(
+    State(st): State<Shared>,
+    _a: Admin,
+    body: axum::body::Bytes,
+) -> AppResult<Json<Value>> {
+    let req: adm::NotifyTestReq = if body.iter().all(u8::is_ascii_whitespace) {
+        Default::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| AppError::invalid(e.to_string()))?
+    };
+    if let Some(ch) = &req.channel {
+        if !adm::channel::ALL.contains(&ch.as_str()) {
+            return Err(AppError::invalid(format!("unknown channel {ch}")));
+        }
+    }
     let st2 = st.clone();
-    let s = st.db.run(move |c| backup::load_settings(c, &st2)).await?;
-    let failed = backup::notify::send(
-        &s.notify,
+    let stored = st.db.run(move |c| backup::load_settings(c, &st2)).await?;
+    let cfg = match req.notify {
+        Some(mut n) => {
+            unmask_secrets(&mut n, &stored.notify);
+            n
+        }
+        None => stored.notify,
+    };
+    let (title, text) = (
         "NyaPassword 测试通知",
         "如果你收到这条消息，告警通道工作正常。",
-    )
-    .await;
+    );
+    let failed = match &req.channel {
+        Some(ch) => backup::notify::send_to(&cfg, &[ch.as_str()], title, text).await,
+        None => backup::notify::send(&cfg, title, text).await,
+    };
     Ok(Json(json!({ "failed": failed })))
+}
+
+// ------------------------------------------------------------------ admin account
+
+const MIN_ADMIN_PASSWORD: usize = 12;
+
+/// Checks the admin password again before sensitive changes, so a stolen
+/// session token alone cannot lock the admin out.
+async fn confirm_password(st: &Shared, password: String) -> AppResult<()> {
+    let ok = st
+        .db
+        .run(move |c| match db::get_setting(c, PASSWORD_KEY)? {
+            Some(hash) => password_matches(&hash, &password),
+            None => Ok(false),
+        })
+        .await?;
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            api::code::FORBIDDEN,
+            "the admin password is wrong",
+        ))
+    }
+}
+
+pub async fn security(State(st): State<Shared>, _a: Admin) -> AppResult<Json<adm::AdminSecurity>> {
+    let totp = st.db.run(|c| Ok(db::get_setting(c, TOTP_KEY)?)).await?;
+    Ok(Json(adm::AdminSecurity {
+        totp_enabled: totp.is_some(),
+    }))
+}
+
+/// Changes the admin password; every other admin session ends.
+pub async fn change_password(
+    State(st): State<Shared>,
+    a: Admin,
+    Json(req): Json<adm::AdminPasswordReq>,
+) -> AppResult<Json<Value>> {
+    if req.new.chars().count() < MIN_ADMIN_PASSWORD {
+        return Err(AppError::invalid(format!(
+            "use at least {MIN_ADMIN_PASSWORD} characters"
+        )));
+    }
+    confirm_password(&st, req.current).await?;
+    let new = req.new;
+    st.db
+        .run(move |c| {
+            set_password(c, &new)?;
+            db::audit(c, None, "admin_password_change", "", "admin", "")?;
+            Ok(())
+        })
+        .await?;
+    st.admin_sessions
+        .lock()
+        .expect("lock")
+        .retain(|h, _| h == &a.token_hash);
+    Ok(Json(json!({})))
+}
+
+/// Proposes a new TOTP secret. Nothing changes until `totp_enable` proves
+/// that the authenticator app produces matching codes.
+pub async fn totp_setup(
+    State(st): State<Shared>,
+    _a: Admin,
+    Json(req): Json<adm::AdminConfirmReq>,
+) -> AppResult<Json<adm::TotpSetup>> {
+    confirm_password(&st, req.password).await?;
+    let secret = npw_otp::base32_encode(&npw_crypto::random_bytes::<20>());
+    Ok(Json(adm::TotpSetup {
+        uri: totp_uri(&secret),
+        secret,
+    }))
+}
+
+pub async fn totp_enable(
+    State(st): State<Shared>,
+    _a: Admin,
+    Json(req): Json<adm::TotpEnableReq>,
+) -> AppResult<Json<Value>> {
+    confirm_password(&st, req.password).await?;
+    let secret = req.secret.trim().to_uppercase();
+    if secret.len() < 16 || npw_otp::OtpSpec::parse(&secret).is_err() {
+        return Err(AppError::invalid("bad TOTP secret"));
+    }
+    if !totp_matches(&secret, &req.code)? {
+        return Err(AppError::invalid(
+            "the code does not match: check the authenticator app and the clock",
+        ));
+    }
+    st.db
+        .run(move |c| {
+            db::set_setting(c, TOTP_KEY, &secret)?;
+            db::audit(c, None, "admin_totp_on", "", "admin", "")?;
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({})))
+}
+
+pub async fn totp_disable(
+    State(st): State<Shared>,
+    _a: Admin,
+    Json(req): Json<adm::AdminConfirmReq>,
+) -> AppResult<Json<Value>> {
+    confirm_password(&st, req.password).await?;
+    st.db
+        .run(|c| {
+            c.execute("DELETE FROM settings WHERE k = ?1", [TOTP_KEY])?;
+            db::audit(c, None, "admin_totp_off", "", "admin", "")?;
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({})))
 }

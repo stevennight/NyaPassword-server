@@ -29,19 +29,36 @@ docker compose up -d
 - 服务只监听 `127.0.0.1:8087`，由 Caddy（`deploy/caddy/Caddyfile`，把 `vault.example.com` 换成你的域名）负责 HTTPS 和 WebSocket。
 - 数据在 `./data`：`nyapassword.sqlite3`（数据库）、`attachments/`（加密附件）、`server.key`（服务端自己的密钥，备份里也有）。
 - 第一个账户可以直接注册；之后注册需要邀请码：`docker compose exec nyapassword nyapassword-server invite`。
-- 管理后台：`https://vault.example.com/admin`。密码：`.env` 的 `ADMIN_PASSWORD`（只在未设置时生效）或 `docker compose exec nyapassword nyapassword-server admin-password`；建议再开 TOTP：`... nyapassword-server admin-totp`。
+- 管理后台：`https://vault.example.com/admin`。密码：`.env` 的 `ADMIN_PASSWORD`（只在未设置时生效）或 `docker compose exec nyapassword nyapassword-server admin-password`；建议再开 TOTP：管理后台“管理员”页，或 `... nyapassword-server admin-totp`（手机丢了用 `admin-totp --off` 关闭）。
+
+## 管理后台
+
+左侧导航，每项一页（手机上收进左上角菜单）：
+
+| 页面 | 内容 |
+|---|---|
+| 概览 | 状态卡片；**待处理清单**（没有备份目标、没有离线恢复密钥、没有告警通道、备份失败或超过 26 小时、自动校验失败、管理员没开 TOTP、手动恢复演练超过 90 天），点一项直接跳到修复它的页面 |
+| 备份 | 上次成功、下次计划、有没有未备份的变更、“立即备份”；备份目标列表（测试连接、编辑、停用、删除）；“添加目标”向导：选类型（阿里云 OSS / WebDAV / 服务器上的目录）→ 填写 → 测试连接 → 保存；最近备份记录 |
+| 恢复密钥 | 离线恢复密钥（原“备份接收者”）。“生成离线恢复密钥”在浏览器里生成，私钥不发给服务器；下载或打印“备份恢复密钥”页（含恢复命令），勾选“我已保存”后才登记公钥。也可以粘贴已有的 `age1…` 公钥。服务器自己的密钥总是接收者 |
+| 备份校验 | 每周自动校验（原“演练”）的结果和“立即校验”；每季度用离线恢复密钥做一次手动恢复演练的步骤，做完点“标记为已完成” |
+| 告警通知 | Webhook、Telegram、Bark、邮件（SMTP）各一行：已配置 / 未配置、开关；点开填写，单独“发送测试”（不用先保存）；选择哪些事件通知（备份失败、校验失败、太久没有成功备份） |
+| 计划与保留 | 变更后等待几分钟、每日备份时间（按浏览器时区显示）、保留份数（最近 / 每日 / 每周 / 每月） |
+| 账户与设备、邀请码、审计日志 | 同前 |
+| 管理员 | 修改管理员密码、开关两步验证（TOTP）；都要再输一次当前密码 |
 
 ## 备份
 
-在管理后台“备份与恢复”配置：
+在管理后台配置：
 
-1. **离线密钥**：在自己电脑上生成 `nyapassword-server age-keygen`，私钥打印进紧急恢复包、存 U 盘，**不要只存在密码库里**；公钥（`age1...`）填进“备份接收者”。
-2. **备份目标**：
+1. **恢复密钥**：在“恢复密钥”页点“生成离线恢复密钥”，下载或打印，和紧急恢复包放在一起，**不要只存在密码库或服务器上**，再确认登记。不想在浏览器里生成时，在一台离线电脑上运行 `nyapassword-server age-keygen`，把公钥（`age1...`）粘贴进去。
+2. **备份目标**（“备份 → 添加目标”）：
    - 阿里云 OSS：建议给服务器一个只有 `oss:PutObject`、`oss:GetObject`、`oss:ListObjects` 权限的 AccessKey，桶开版本控制 / 合规保留策略，勾选“防删模式”（服务端不再清理，过期交给生命周期规则）。
    - WebDAV（坚果云、NAS 等）：服务端按保留策略清理旧备份。
-3. “测试”按钮会写入、读回、删除一个探测文件；防删模式下删除失败是预期的。
+   - 服务器上的目录（如挂载的 NAS；Docker 部署时先把目录映射进容器）。
+3. 向导里的“测试连接”会写入、读回、删除一个探测文件；防删模式下删除失败是预期的。
+4. **告警通知**至少开一个渠道，用“发送测试”确认收得到。
 
-之后：有变更 10 分钟后自动备份（每小时最多一次）、每天定时一次；上传后读回校验；每周自动恢复演练；超过 26 小时没有成功备份会告警（Webhook / Telegram / Bark / 邮件）。
+之后：有变更 10 分钟后自动备份（每小时最多一次）、每天定时一次；上传后读回校验；每周自动校验（下载最新备份、用服务器自己的密钥解密、检查数据库）；超过 26 小时没有成功备份会告警。
 
 ## 恢复
 
@@ -54,7 +71,7 @@ nyapassword-server restore --identity offline.key --to ./data \
 nyapassword-server restore --identity offline.key --file ./nyapassword-....tar.zst.age --to ./data
 ```
 
-加 `--dry-run` 只下载、解密、校验，不写任何东西（建议每季度做一次手动演练）。恢复后数据库的 epoch 会变，所有客户端下次同步时自动对账，并把比备份新的内容重新上传。
+`--identity` 可以直接用管理后台下载的 `nyapassword-recovery-key.txt`（`#` 开头的说明行会被跳过）。加 `--dry-run` 只下载、解密、校验，不写任何东西（建议每季度做一次手动演练，做完在“备份校验”页标记）。恢复后数据库的 epoch 会变，所有客户端下次同步时自动对账，并把比备份新的内容重新上传。
 
 ## 发布
 

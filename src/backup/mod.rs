@@ -7,7 +7,7 @@ pub mod targets;
 
 use std::collections::BTreeMap;
 
-use npw_api::admin::{BackupRun, BackupSettings, DrillRun, Retention, TargetResult};
+use npw_api::admin::{alert, BackupRun, BackupSettings, DrillRun, Retention, TargetResult};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::{self, now_ms};
@@ -27,6 +27,7 @@ pub fn default_settings() -> BackupSettings {
         debounce_minutes: 10,
         daily_hour_utc: 19,
         notify: Default::default(),
+        recipient_info: vec![],
     }
 }
 
@@ -267,10 +268,22 @@ pub async fn run_backup(st: &Shared, trigger: &str) -> AppResult<BackupRun> {
     if !failed.is_empty() {
         let body = failed
             .iter()
-            .map(|r| format!("{}: {}", r.target_id, r.error))
+            .map(|r| {
+                let name = targets
+                    .iter()
+                    .find(|t| t.target.id == r.target_id)
+                    .map_or(r.target_id.as_str(), |t| t.target.name.as_str());
+                format!("{name}: {}", r.error)
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        notify::send(&settings.notify, "NyaPassword 备份失败", &body).await;
+        notify::send_event(
+            &settings.notify,
+            alert::BACKUP_FAILED,
+            "NyaPassword 备份失败",
+            &body,
+        )
+        .await;
     }
     tracing::info!(
         "backup {} ({}): {} bytes, {} ok / {} targets",
@@ -386,9 +399,10 @@ pub async fn run_drill(st: &Shared, target_id: Option<String>) -> AppResult<Dril
     if !run.ok {
         let st2 = st.clone();
         let settings = st.db.run(move |c| load_settings(c, &st2)).await?;
-        notify::send(
+        notify::send_event(
             &settings.notify,
-            "NyaPassword 恢复演练失败",
+            alert::CHECK_FAILED,
+            "NyaPassword 备份校验失败",
             &format!("{}: {}", t.target.name, run.detail),
         )
         .await;
@@ -546,8 +560,9 @@ async fn tick(st: &Shared) -> AppResult<()> {
     }
     let stale = last_success.is_none_or(|t| now - t > 26 * hour);
     if stale && now - alerted > 24 * hour && now - st.started_at > hour {
-        notify::send(
+        notify::send_event(
             &settings.notify,
+            alert::STALE,
             "NyaPassword 备份告警",
             "超过 26 小时没有成功的备份，请检查备份目标。",
         )
