@@ -982,3 +982,71 @@ async fn sign_out_does_not_wait_for_an_unresponsive_server() {
     assert!(!held.lock().unwrap().is_empty(), "the logout was attempted");
     srv.stop().await;
 }
+
+// ------------------------------------------------------------------ 15. concurrent session renewal
+
+/// Unlocked without the master password (PIN / biometrics): no silent sign-in,
+/// so the refresh token is the only way to renew the session.
+async fn quick_unlocked(srv: &TestServer) -> (Client, Arc<MemoryStore>) {
+    let store = Arc::new(MemoryStore::new());
+    let a = client_with_store("A", store.clone());
+    a.register(&srv.url, "me@example.com", "pw", None)
+        .await
+        .unwrap();
+    a.sync().await.unwrap();
+    let key = a.quick_unlock_key().unwrap();
+    a.lock();
+    a.unlock_with_key(&key).unwrap();
+    (a, store)
+}
+
+/// Right after unlocking the web UI starts a sync and the events socket at
+/// once: they must not spend the same single-use refresh token twice.
+async fn renew_together(a: &Client) {
+    let (s, e, d) = tokio::join!(a.sync(), a.events_token(), a.devices());
+    s.unwrap();
+    e.unwrap();
+    d.unwrap();
+    a.sync().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_access_token_is_refreshed_once_by_concurrent_callers() {
+    let srv = TestServer::start().await;
+    let (a, store) = quick_unlocked(&srv).await;
+    let key = a.quick_unlock_key().unwrap();
+    drop(a);
+
+    // the access token expired while the app was locked
+    let device_key = Key32::from_bytes([7u8; 32]);
+    let ad = aad::device_secret("session");
+    let sealed = store.get_meta("session").unwrap().unwrap();
+    let mut s: Value =
+        serde_json::from_slice(&envelope::open(&device_key, &sealed, &ad).unwrap()).unwrap();
+    s["access_expires_at"] = json!(0);
+    store
+        .apply(vec![npw_core::StoreOp::PutMeta(
+            "session".into(),
+            envelope::seal(&device_key, s.to_string().as_bytes(), &ad),
+        )])
+        .unwrap();
+    let a = client_with_store("A", store);
+    a.unlock_with_key(&key).unwrap();
+
+    renew_together(&a).await;
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_access_token_is_renewed_once_by_concurrent_callers() {
+    let srv = TestServer::start().await;
+    let (a, _) = quick_unlocked(&srv).await;
+    // the server no longer knows the access token (the refresh token still works)
+    srv.state
+        .db
+        .run_sync(|conn| Ok(conn.execute("DELETE FROM sessions WHERE kind = 'access'", [])?))
+        .unwrap();
+
+    renew_together(&a).await;
+    srv.stop().await;
+}
