@@ -26,7 +26,7 @@ jobs:
       common: ${{ steps.version.outputs.common }}
     steps:
       - name: Check out server
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: server
           persist-credentials: false
@@ -46,7 +46,7 @@ jobs:
           echo "common=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Check out common
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository_owner }}/NyaPassword-common
           # read-only deploy key of the (private) common repository
@@ -71,13 +71,13 @@ jobs:
       packages: write
     steps:
       - name: Check out server
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: server
           persist-credentials: false
 
       - name: Check out common
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository_owner }}/NyaPassword-common
           # read-only deploy key of the (private) common repository
@@ -87,10 +87,10 @@ jobs:
           persist-credentials: false
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -102,7 +102,7 @@ jobs:
 
       - name: Tags
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
@@ -111,7 +111,7 @@ jobs:
             type=raw,value=latest,enable=${{ needs.test.outputs.prerelease == 'false' }}
 
       - name: Build and push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: server/Dockerfile
@@ -130,7 +130,7 @@ jobs:
       contents: write
     steps:
       - name: Check out server
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: server
           persist-credentials: false
@@ -145,7 +145,7 @@ jobs:
           (cd dist && sha256sum "$name" > SHA256SUMS)
 
       - name: Publish
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           name: NyaPassword Server ${{ github.ref_name }}
           prerelease: ${{ needs.test.outputs.prerelease }}
