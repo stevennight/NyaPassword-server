@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "nyapassword-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "argon2",
